@@ -31,7 +31,7 @@
 
 tlv8_t::tlv8_t(uint8_t tag, size_t len, const uint8_t* val) : tag{tag}, len{len} {       
   if(len>0){
-    this->val=std::unique_ptr<uint8_t>((uint8_t *)HS_MALLOC(len));
+    this->val.reset((uint8_t *)HS_MALLOC(len));
     if(val!=NULL)
       memcpy((this->val).get(),val,len);      
   }
@@ -41,9 +41,11 @@ tlv8_t::tlv8_t(uint8_t tag, size_t len, const uint8_t* val) : tag{tag}, len{len}
 
 void tlv8_t::update(size_t addLen, const uint8_t *addVal){
   if(addLen>0){
-    uint8_t *p=val.release();
-    p=(uint8_t *)HS_REALLOC(p,len+addLen);
-    val=std::unique_ptr<uint8_t>(p);
+    uint8_t *p=(uint8_t *)HS_REALLOC(val.get(),len+addLen);
+    if(p==NULL)                                   // allocation failed - leave existing value unchanged
+      return;
+    val.release();                                // ownership transferred to realloc'd pointer
+    val.reset(p);
     if(addVal!=NULL)
       memcpy(p+len,addVal,addLen);
     len+=addLen;        

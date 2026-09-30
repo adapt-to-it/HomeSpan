@@ -37,10 +37,12 @@
 class tlv8_t {
   
   private:
+
+  struct freeDeleter { void operator()(uint8_t *p) const {free(p);} };      // memory is allocated with HS_MALLOC/HS_REALLOC, so it must be released with free() rather than delete
   
   uint8_t tag;
   size_t len;
-  std::unique_ptr<uint8_t> val;
+  std::unique_ptr<uint8_t, freeDeleter> val;
 
   public:
  

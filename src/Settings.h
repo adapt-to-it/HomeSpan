@@ -50,6 +50,10 @@
 
 #define     DEFAULT_TCP_PORT          80                  // change with homeSpan.setPort(port);
 
+#define     DEFAULT_TCP_KEEPALIVE_IDLE      60            // seconds of inactivity on a HAP connection before sending TCP keep-alive probes (lwIP default is 7200)
+#define     DEFAULT_TCP_KEEPALIVE_INTERVAL  10            // seconds between TCP keep-alive probes
+#define     DEFAULT_TCP_KEEPALIVE_COUNT     3             // number of unanswered TCP keep-alive probes before a HAP connection is considered dead and closed
+
 #define     DEFAULT_WEBLOG_URL        "status"            // change with optional fourth argument in homeSpan.enableWebLog()
 
 #define     DEFAULT_FAVICON           "https://raw.githubusercontent.com/HomeSpan/HomeSpan/refs/heads/master/docs/images/HomeSpanLogo.png"

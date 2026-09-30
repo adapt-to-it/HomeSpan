@@ -29,7 +29,7 @@
 // HAP CHARACTERISTICS (HAP Chapter 9) //
 //////////////////////////////////////////
 
-enum PERMS{       // create bitflags based on HAP Table 6-4
+enum PERMS : uint8_t {       // create bitflags based on HAP Table 6-4
   PR=1,
   PW=2,
   EV=4,
@@ -40,7 +40,7 @@ enum PERMS{       // create bitflags based on HAP Table 6-4
   NV=128          // this is a non-HAP flag used to specify that no value should be provided (should be a HAP flag!)
 };
 
-enum FORMAT {     // HAP Table 6-5
+enum FORMAT : uint8_t {     // HAP Table 6-5
   BOOL=0,
   UINT8=1,
   UINT16=2,
@@ -65,7 +65,7 @@ struct HapChar {
 
 ///////////////////////////////
 
-#define HAPCHAR(hapName,type,perms,format,staticRange)  HapChar hapName {#type,#hapName,(PERMS)(perms),format,staticRange}
+#define HAPCHAR(hapName,type,perms,format,staticRange)  const HapChar hapName {#type,#hapName,(PERMS)(perms),format,staticRange}
 
 struct HapCharacteristics {
   
@@ -189,4 +189,4 @@ struct HapCharacteristics {
 
 };
 
-extern HapCharacteristics hapChars;
+extern const HapCharacteristics hapChars;       // declared const so that all HAP Characteristic definitions are stored in flash rather than RAM

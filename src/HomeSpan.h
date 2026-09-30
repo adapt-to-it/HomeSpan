@@ -34,6 +34,7 @@
 
 #include <Arduino.h>
 #include <unordered_map>
+#include <map>
 #include <vector>
 #include <list>
 #include <shared_mutex>
@@ -86,8 +87,8 @@ typedef const char * STRING_t;
 typedef const TLV8 & TLV_ENC_t;
 typedef std::pair<const uint8_t *, size_t> DATA_t;
 
-static DATA_t NULL_DATA={NULL,0};
-static TLV8 NULL_TLV{};
+inline DATA_t NULL_DATA={NULL,0};
+inline TLV8 NULL_TLV{};
 
 ///////////////////////////////
 // Macros to lock/unlock poll() mutex
@@ -158,7 +159,7 @@ class Controller {
     size_t olen;
     TempBuffer<char> tBuf(256);
     mbedtls_base64_encode((uint8_t *)tBuf.get(),256,&olen,(uint8_t *)this,sizeof(struct Controller));
-    asprintf(buf,tBuf.get());
+    asprintf(buf,"%s",tBuf.get());
     return(*buf);
   }
 
@@ -230,7 +231,7 @@ struct SpanWebLog{                            // optional web status/log data
     uint64_t upTime;                          // number of seconds since booting
     struct tm clockTime;                      // clock time
     char *message;                            // pointers to log entries of arbitrary size
-    String clientIP;                          // IP address of client making request (or "0.0.0.0" if not applicable)
+    char clientIP[46];                        // IP address of client making request (or "0.0.0.0" if not applicable) - fixed-size array so entries allocated with HS_CALLOC (PSRAM when available) need no construction or additional heap
   } *log=NULL;                                // array of log entries 
 
   void init(uint16_t maxEntries, const char *serv, const char *tz, const char *url);
@@ -287,7 +288,7 @@ class Span{
   HapQR qrCode;                                 // optional QR Code to use for pairing
   const char *sketchVersion="n/a";              // version of the sketch
   char pairingCodeCommand[12]="";               // user-specified Pairing Code - only needed if Pairing Setup Code is specified in sketch using setPairingCode()
-  String lastClientIP="0.0.0.0";                // IP address of last client accessing device through encrypted channel
+  char lastClientIP[46]="0.0.0.0";              // IP address of last client accessing device through encrypted channel
   boolean newCode;                              // flag indicating new application code has been loaded (based on keeping track of app SHA256)
   boolean serialInputDisabled=false;            // flag indiating that serial input is disabled
   uint8_t rebootCount=0;                        // counts number of times device was rebooted (used in optional Reboot callback)
@@ -321,7 +322,7 @@ class Span{
   int rescanThreshold;
   unsigned long rescanAlarm;
   enum {RESCAN_IDLE, RESCAN_PENDING, RESCAN_RUNNING} rescanStatus=RESCAN_IDLE;
-  unordered_map<string, string> bssidNames;
+  std::map<string, string> bssidNames;
   
   const char *defaultSetupCode=DEFAULT_SETUP_CODE;            // Setup Code used for pairing
   uint16_t autoOffLED=0;                                      // automatic turn-off duration (in seconds) for Status LED
@@ -364,8 +365,8 @@ class Span{
   vector<SpanService *, Mallocator<SpanService *>> Loops;                // vector of pointer to all Services that have over-ridden loop() methods
   SpanBufVec Notifications;                                              // vector of SpanBuf objects that store info for Characteristics that are updated with setVal() and require a Notification Event
   vector<SpanButton *,  Mallocator<SpanButton *>> PushButtons;           // vector of pointer to all PushButtons
-  unordered_map<uint64_t, uint32_t> TimedWrites;                         // map of timed-write PIDs and Alarm Times (based on TTLs)  
-  unordered_map<char, SpanUserCommand *> UserCommands;                   // map of pointers to all UserCommands
+  std::map<uint64_t, uint32_t> TimedWrites;                              // map of timed-write PIDs and Alarm Times (based on TTLs)  
+  std::map<char, SpanUserCommand *> UserCommands;                        // map of pointers to all UserCommands
 
   void pollTask();                                                       // poll HAP Clients and process any new HAP requests
   void configureNetwork();                                               // configure Network services (MDNS, WebLog,  OTA, etc.) and start HAP Server
@@ -592,8 +593,8 @@ class SpanService{
   protected:
   
   virtual ~SpanService();                                                           // destructor
-  vector<HapChar *, Mallocator<HapChar*>> req;                                      // vector of pointers to all required HAP Characteristic Types for this Service
-  vector<HapChar *, Mallocator<HapChar*>> opt;                                      // vector of pointers to all optional HAP Characteristic Types for this Service
+  vector<const HapChar *, Mallocator<const HapChar*>> req;                                      // vector of pointers to all required HAP Characteristic Types for this Service
+  vector<const HapChar *, Mallocator<const HapChar*>> opt;                                      // vector of pointers to all optional HAP Characteristic Types for this Service
 
   public:
   
@@ -649,7 +650,7 @@ class SpanCharacteristic{
 
   uint32_t iid=0;                          // Instance ID (HAP Table 6-3)
   uint32_t aid=0;                          // AID for the enclosing Accessory
-  HapChar *hapChar;                        // pointer to HAP Characteristic structure
+  const HapChar *hapChar;                  // pointer to HAP Characteristic structure
   const char *type;                        // Characteristic Type
   const char *hapName;                     // HAP Name
   UVal value;                              // Characteristic Value
@@ -678,6 +679,7 @@ class SpanCharacteristic{
   void printfAttributes(int flags);                           // writes Characteristic JSON to hapOut stream
   StatusCode loadUpdate(char *val, char *ev, boolean wr);     // load updated val/ev from PUT /characteristic JSON request.  Return intitial HAP status code (checks to see if characteristic is found, is writable, etc.)  
   String uvPrint(UVal &u);                                    // returns "printable" String for any type of Characteristic  
+  void uvStream(UVal &u);                                     // streams "printable" value for any type of Characteristic directly to hapOut (avoids creating temporary Strings)
   
   void uvSet(UVal &dest, UVal &src);                          // copies UVal src into UVal dest
   void uvSet(UVal &u, STRING_t val);                          // copies string val into UVal u
@@ -790,7 +792,7 @@ class SpanCharacteristic{
 
   public:
 
-  SpanCharacteristic(HapChar *hapChar, boolean isCustom=false);                               // SpanCharacteristic constructor
+  SpanCharacteristic(const HapChar *hapChar, boolean isCustom=false);                               // SpanCharacteristic constructor
   void *operator new(size_t size){return(HS_MALLOC(size));}                                   // override new operator to use PSRAM when available
   void operator delete(void *p){free(p);}
 
@@ -827,8 +829,7 @@ class SpanCharacteristic{
         SpanBuf sb;                             // create SpanBuf object
         sb.characteristic=this;                 // set characteristic          
         sb.status=StatusCode::OK;               // set status
-        char dummy[]="";
-        sb.val=dummy;                           // set dummy "val" so that printfNotify knows to consider this "update"
+        sb.val=const_cast<char *>("");             // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
         homeSpan.Notifications.push_back(sb);   // store SpanBuf in Notifications vector  
       }
     

@@ -89,6 +89,21 @@ LedC::LedC(uint8_t pin, uint16_t freq, boolean invert){
 
 ///////////////////
 
+void LedC::setDuty(uint32_t duty){
+
+  channel->duty=duty;
+
+  if(!configured){                                                    // first call requires full configuration of channel (including GPIO)
+    ledc_channel_config(channel);
+    configured=true;
+  } else {                                                            // subsequent calls only need to update duty (much faster, and glitch-free since update occurs at start of next PWM cycle)
+    ledc_set_duty(channel->speed_mode,channel->channel,duty);
+    ledc_update_duty(channel->speed_mode,channel->channel);
+  }
+}
+
+///////////////////
+
 LedPin::LedPin(uint8_t pin, float level, uint16_t freq, boolean invert) : LedC(pin, freq, invert){
   
   if(!channel){
@@ -126,10 +141,16 @@ void LedPin::set(float level){
   if(level>100)
     level=100;
 
-  float d=level*(pow(2,(int)timer->duty_resolution)-1)/100.0;  
-    
-  channel->duty=d;
-  ledc_channel_config(channel); 
+  if(level<0)
+    level=0;
+
+  if(fadeState==FADING){                        // a fade is in progress: stop it by fully re-configuring the channel (same behavior as before)
+    channel->duty=level*maxDuty()/100.0;
+    ledc_channel_config(channel);
+    return;
+  }
+
+  setDuty(level*maxDuty()/100.0);
 }
 
 ///////////////////
@@ -145,10 +166,13 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
   if(level>100)
     level=100;
 
-  float d=level*(pow(2,(int)timer->duty_resolution)-1)/100.0;
+  if(level<0)
+    level=0;
+
+  float d=level*maxDuty()/100.0;
 
   if(fadeType==PROPORTIONAL)
-    fadeTime*=fabs((float)ledc_get_duty(channel->speed_mode,channel->channel)-d)/(float)(pow(2,(int)timer->duty_resolution)-1);
+    fadeTime*=fabs((float)ledc_get_duty(channel->speed_mode,channel->channel)-d)/(float)maxDuty();
 
   fadeState=FADING;
   ledc_set_fade_time_and_start(channel->speed_mode,channel->channel,d,fadeTime,LEDC_FADE_NO_WAIT);
@@ -271,14 +295,12 @@ void ServoPin::set(double degrees){
     else if(usec>maxMicros)
       usec=maxMicros;
   
-    usec*=timer->freq_hz/1e6*(pow(2,(int)timer->duty_resolution)-1);
+    usec*=timer->freq_hz/1e6*maxDuty();
   
-    channel->duty=usec;
+    setDuty(usec);
   } else {
-    channel->duty=0;
+    setDuty(0);
   }
-  
-  ledc_channel_config(channel);
 }
 
 ////////////////////////////

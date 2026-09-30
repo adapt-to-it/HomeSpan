@@ -60,8 +60,11 @@ class LedC {
     
     ledc_channel_config_t *channel=NULL;
     ledc_timer_config_t *timer;
+    boolean configured=false;                                          // set to true once channel has been fully configured
     
     LedC(uint8_t pin, uint16_t freq, boolean invert=false);
+    void setDuty(uint32_t duty);                                       // sets duty (fully configures channel on first call, then just updates duty)
+    uint32_t maxDuty(){return((1<<timer->duty_resolution)-1);}        // maximum duty value based on timer resolution
 
   public:
     int getPin(){return(channel?channel->gpio_num:-1);}               // returns the pin number

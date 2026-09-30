@@ -34,6 +34,25 @@
 Blinker::Blinker(Blinkable *led, uint16_t autoOffDuration){
   this->led=led;
   pauseDuration=autoOffDuration*1000;
+  if(led)
+    stopSem=xSemaphoreCreateBinary();
+}
+
+//////////////////////////////////////
+
+// The blink tasks are never deleted from outside (which could interrupt an LED in the middle of an update, such as
+// an RMT transmission for a Pixel, leaving the driver reading from the stack of a deleted task).  Instead, stop() sends
+// a task notification, which wakes the task from its current wait so that it can exit cleanly on its own.
+
+boolean Blinker::wait(int ms){
+  return(ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(ms))>0);
+}
+
+//////////////////////////////////////
+
+void Blinker::exitTask(Blinker *b){
+  xSemaphoreGive(b->stopSem);
+  vTaskDelete(NULL);
 }
 
 //////////////////////////////////////
@@ -45,11 +64,14 @@ void Blinker::blinkTask(void *arg){
   for(;;){
     for(int i=0;i<b->nBlinks;i++){
       b->led->on();
-      delay(b->onTime);
+      if(wait(b->onTime))
+        exitTask(b);
       b->led->off();
-      delay(b->offTime);
+      if(wait(b->offTime))
+        exitTask(b);
     }
-    delay(b->delayTime);
+    if(wait(b->delayTime))
+      exitTask(b);
   }
   
 }
@@ -63,12 +85,15 @@ void Blinker::blinkTaskInverted(void *arg){
   b->led->on();
 
   for(;;){
-    delay(b->delayTime);
+    if(wait(b->delayTime))
+      exitTask(b);
     for(int i=0;i<b->nBlinks;i++){
       b->led->off();
-      delay(b->onTime);
+      if(wait(b->onTime))
+        exitTask(b);
       b->led->on();
-      delay(b->offTime);
+      if(wait(b->offTime))
+        exitTask(b);
     }
   }
   
@@ -112,7 +137,8 @@ void Blinker::stop(){
     return;  
   
   if(blinkHandle!=NULL){
-    vTaskDelete(blinkHandle);
+    xTaskNotifyGive(blinkHandle);                   // ask blink task to stop...
+    xSemaphoreTake(stopSem,portMAX_DELAY);          // ...and wait until it has done so
     blinkHandle=NULL;
   }    
 
