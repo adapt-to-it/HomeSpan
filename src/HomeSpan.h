@@ -38,6 +38,7 @@
 #include <vector>
 #include <list>
 #include <shared_mutex>
+#include <mutex>
 #include <nvs.h>
 #include <ArduinoOTA.h>
 #include <ETH.h>
@@ -93,7 +94,7 @@ inline TLV8 NULL_TLV{};
 ///////////////////////////////
 // Macros to lock/unlock poll() mutex
 
-#define homeSpanPAUSE std::shared_lock pollLock(homeSpan.getMutex());
+#define homeSpanPAUSE std::unique_lock pollLock(homeSpan.getMutex());
 #define homeSpanRESUME if(pollLock.owns_lock()){pollLock.unlock();}
 
 ///////////////////////////////
@@ -356,6 +357,7 @@ class Span{
   TaskHandle_t loopTaskHandle;                      // Arduino Loop Task handle
   boolean verboseWifiReconnect = true;              // set to false to not print WiFi reconnect attempts messages
   std::shared_mutex pollMutex;                      // mutex lock for poll task
+  std::mutex notifyMutex;                           // mutex lock for Notifications vector
   hsWatchdogTimer hsWDT;                            // general homeSpan watchdog timer
     
   SpanOTA spanOTA;                                  // manages OTA process
@@ -370,6 +372,7 @@ class Span{
   std::map<uint64_t, uint32_t> TimedWrites;                              // map of timed-write PIDs and Alarm Times (based on TTLs)  
   std::map<char, SpanUserCommand *> UserCommands;                        // map of pointers to all UserCommands
 
+  void addNotification(SpanCharacteristic *c);                           // adds Characteristic to Notifications vector (safe to call from any task)
   void pollTask();                                                       // poll HAP Clients and process any new HAP requests
   void configureNetwork();                                               // configure Network services (MDNS, WebLog,  OTA, etc.) and start HAP Server
   void commandMode();                                                    // allows user to control and reset HomeSpan settings with the control button
@@ -400,6 +403,19 @@ class Span{
   }
 
   QueueHandle_t networkEventQueue;                         // queue to transmit network events from callback thread to HomeSpan thread
+
+  struct RunItem {void (*f)(void *); void *arg;};          // function and argument queued by runInPoll()
+  static const int RUN_QUEUE_SIZE=16;                      // depth of runInPoll() queue
+  QueueHandle_t runQueue=NULL;                             // queue of functions to run in the poll task
+
+  enum CallbackType {CB_STATUS, CB_CONNECTION, CB_PAIR, CB_CONTROLLER};     // user callbacks that can be moved out of the poll task
+  struct CallbackItem {CallbackType type; int32_t arg;};   // callback type and its argument
+  static const int CALLBACK_QUEUE_SIZE=16;                 // depth of callback queue
+  QueueHandle_t callbackQueue=NULL;                        // queue of callbacks for the callback task (NULL if callback task is not active)
+  void dispatchCallback(CallbackType type, int32_t arg);   // calls user callback directly, or queues it if callback task is active
+  void callUserCallback(const CallbackItem &item);         // calls the user callback matching item (if set)
+
+  static const time_t MIN_VALID_TIME=1700000000;           // system time greater than this value (Nov 2023) is considered valid
   void networkCallback(const arduino_event_t &event);      // network event handler (works for WiFi as well as Ethernet)
 
   void init();    // performs all late-stage initializations needed
@@ -503,6 +519,7 @@ class Span{
   Span& setWebLogFavicon(const char *favicon=DEFAULT_FAVICON){asprintf(&webLog.faviconURL,"%s",favicon);return(*this);}
   void getWebLog(void (*f)(const char *, void *), void *);
   void assumeTimeAcquired(){webLog.timeInit=true;}
+  boolean isTimeAcquired(){return(webLog.timeInit || time(NULL)>MIN_VALID_TIME);}       // returns true if time has been acquired by HomeSpan or system clock is valid; can be called from any task
 
   Span& setVerboseWifiReconnect(bool verbose=true){verboseWifiReconnect=verbose;return(*this);}
 
@@ -515,6 +532,9 @@ class Span{
   }
 
   TaskHandle_t getAutoPollTask(){return(pollTaskHandle);}
+
+  boolean runInPoll(void (*f)(void *), void *arg=NULL);                      // queues f(arg) to run in the poll task; never blocks; returns false if f is NULL, queue is full, or begin() not yet called; not for use in ISRs
+  Span& setCallbackTask(uint32_t stackSize=4096, uint32_t priority=1, uint32_t core=0);     // creates task to run status, connection, pair, and controller callbacks outside of poll task (only the first call has effect)
 
   Span& setTimeServerTimeout(uint32_t tSec){webLog.waitTime=tSec*1000;return(*this);}    // sets wait time (in seconds) for optional web log time server to connect
   
@@ -633,6 +653,8 @@ class SpanCharacteristic{
   friend class Span;
   friend class SpanService;
 
+  static portMUX_TYPE valMux;                  // spinlock protecting reads and writes of numeric UVal values (64-bit fields are not atomic on 32-bit CPUs)
+
   union UVal {                                  
     boolean BOOL;
     uint8_t UINT8;
@@ -690,6 +712,7 @@ class SpanCharacteristic{
   void uvSet(UVal &u, TLV_ENC_t tlv);                         // copies TLV8 tlv into UVal u (after transforming to a char *)
 
   template <typename T> void uvSet(UVal &u, T val){           // copies numeric val into UVal u  
+    portENTER_CRITICAL(&valMux);                              // only copy bytes inside critical section: no allocation, logging, or library calls
     switch(format){
       case FORMAT::BOOL:
         u.BOOL=(boolean)val;
@@ -715,6 +738,7 @@ class SpanCharacteristic{
       default:
       break;
     } // switch
+    portEXIT_CRITICAL(&valMux);
   }
  
   char *getStringGeneric(UVal &val);                                      // gets the specified UVal for string-based Characteristics
@@ -723,21 +747,26 @@ class SpanCharacteristic{
   
   template <class T> T uvGet(UVal &u){                                    // gets the specified UVal for numeric-based Characteristics
   
+    UVal copy;                                                            // local copy so that conversion happens outside of critical section
+    portENTER_CRITICAL(&valMux);
+    copy=u;
+    portEXIT_CRITICAL(&valMux);
+
     switch(format){   
       case FORMAT::BOOL:
-        return((T) u.BOOL);        
+        return((T) copy.BOOL);        
       case FORMAT::INT:
-        return((T) u.INT);        
+        return((T) copy.INT);        
       case FORMAT::UINT8:
-        return((T) u.UINT8);        
+        return((T) copy.UINT8);        
       case FORMAT::UINT16:
-        return((T) u.UINT16);        
+        return((T) copy.UINT16);        
       case FORMAT::UINT32:
-        return((T) u.UINT32);        
+        return((T) copy.UINT32);        
       case FORMAT::UINT64:
-        return((T) u.UINT64);        
+        return((T) copy.UINT64);        
       case FORMAT::FLOAT:
-        return((T) u.FLOAT);        
+        return((T) copy.FLOAT);        
       default:
       break;
     }
@@ -829,11 +858,7 @@ class SpanCharacteristic{
 
     if(notify){
       if(updateFlag!=2){                        // do not broadcast EV if update is being done in context of write-response
-        SpanBuf sb;                             // create SpanBuf object
-        sb.characteristic=this;                 // set characteristic          
-        sb.status=StatusCode::OK;               // set status
-        sb.val=const_cast<char *>("");             // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
-        homeSpan.Notifications.push_back(sb);   // store SpanBuf in Notifications vector  
+        homeSpan.addNotification(this);         // store SpanBuf in Notifications vector (protected by mutex)
       }
     
       if(nvsKey){
