@@ -109,8 +109,11 @@ class LedPin : public LedC {
     float pendingLevel=0;
     uint32_t pendingTime=0;
     int pendingType=ABSOLUTE;
-    void (*endCallback)(LedPin *, void *)=NULL;
+    void (*endCallback)(LedPin *, void *)=NULL;                        // end-of-fade function and argument: accessed only under pendingMux
     void *endArg=NULL;
+    volatile uint32_t fadeStartMs=0;                                   // millis() when the last fade was started
+    volatile uint32_t fadeDurationMs=0;                                // duration of the last fade, in milliseconds
+    boolean fadeOverdue(){return(fadeState==FADING && (uint32_t)(millis()-fadeStartMs)>fadeDurationMs+250);}   // true if the end of a fade was not detected (read-only)
 
     static bool fadeCallback(const ledc_cb_param_t *param, void *arg);
     static boolean fadeInitialized;

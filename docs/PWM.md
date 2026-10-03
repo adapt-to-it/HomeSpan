@@ -117,7 +117,7 @@ The following PWM resources are available:
 * ESP32-C3: 6 Channels / 4 Timers
 * ESP32-S3: 8 Channels / 4 Timers
 
-HomeSpan *automatically* allocates Channels and Timers to LedPin and ServoPin objects as they are instantiated. Every pin assigned consumes a single Channel;  every *unique* frequency specified among all channels (within the same set, for the ESP32) consumes a single Timer.  HomeSpan will conserve resources by re-using the same Timer for all Channels operating at the same frequency.  *HomeSpan also automatically configures each Timer to support the maximum duty-resolution possible for the frequency specified.*
+HomeSpan *automatically* allocates Channels and Timers to LedPin and ServoPin objects as they are instantiated. Every pin assigned consumes a single Channel;  every *unique* frequency specified among all channels (within the same set, for the ESP32) consumes a single Timer.  HomeSpan will conserve resources by re-using the same Timer for all Channels operating at the same frequency.  *Unless you specify the optional `resolution` argument of the LedPin constructor, HomeSpan automatically configures each Timer to support the maximum duty-resolution possible for the frequency specified.*  A Timer is re-used only if the frequency is the same and the requested resolution is either unspecified (0) or equal to that of the Timer.
 
 #### Sharing PWM Resources with Other Code
 
@@ -126,20 +126,33 @@ If your sketch also uses the LEDC hardware directly (ESP-IDF calls, or Arduino f
 * `static boolean LedC::reserveChannel(ledc_mode_t mode, ledc_channel_t channel)`
 * `static boolean LedC::reserveTimer(ledc_mode_t mode, ledc_timer_t timer)`
 
-Both methods return true if the reservation succeeds.  They return false, and output an error message, if the index is out of range or if the resource has already been assigned to a LedPin or ServoPin.  Call them before creating any LedPin or ServoPin.  A reserved Timer is never shared, even if its frequency matches.  For example:
+Both methods return true if the reservation succeeds.  They return false, and output an error message, if the index is out of range or if the resource has already been assigned to a LedPin or ServoPin.  Call them before creating any LedPin or ServoPin.  A reserved Timer is never shared, even if its frequency matches.
+
+The *mode*, *channel* and *timer* to reserve are the ones your code actually uses.  For code that calls ESP-IDF directly, they are the values passed to `ledc_timer_config()` and `ledc_channel_config()`.  For example, in a sketch using the Low Speed mode (available on all chips):
 
 ```C++
 void setup(){
-  LedC::reserveChannel(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);     // used below by my own code
-  LedC::reserveTimer(LEDC_LOW_SPEED_MODE,LEDC_TIMER_0);
+  LedC::reserveChannel(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);     // same mode and channel as in ledc_channel_config() below
+  LedC::reserveTimer(LEDC_LOW_SPEED_MODE,LEDC_TIMER_0);         // same mode and timer as in ledc_timer_config() below
 
-  ledcAttachChannel(4,1000,10,0);                               // Arduino API: pin 4, 1 kHz, 10 bits, channel 0 (timer assignment is made by Arduino)
+  ledc_timer_config_t myTimer={};                               // my own LEDC code
+  myTimer.speed_mode=LEDC_LOW_SPEED_MODE;
+  myTimer.timer_num=LEDC_TIMER_0;
+  // ...fill in the remaining fields, then call ledc_timer_config(&myTimer) and ledc_channel_config() with channel=LEDC_CHANNEL_0
 
-  new LedPin(18,0,39062,false,11);                              // HomeSpan allocates other resources
+  new LedPin(18,0,39062,false,11);                              // HomeSpan allocates other channels and timers
 }
 ```
 
-Note that Arduino selects its own Timer when attaching a channel, so reserve the Timer that your code actually uses.
+On the original ESP32 (which has the High Speed mode) use `LEDC_HIGH_SPEED_MODE` in the same way, protected by `#if SOC_LEDC_SUPPORT_HS_MODE`.
+
+The Arduino functions `ledcAttach()`, `ledcAttachChannel()` and `analogWrite()` choose the mode and Timer for you.  According to the Arduino-ESP32 core source (`esp32-hal-ledc.c`):
+
+* the mode is derived from the channel number: `mode = channel / SOC_LEDC_CHANNEL_NUM`.  On the original ESP32 channels 0-7 are therefore in `LEDC_HIGH_SPEED_MODE` and channels 8-15 in `LEDC_LOW_SPEED_MODE`.  On chips without High Speed mode all channels are in `LEDC_LOW_SPEED_MODE`.  The channel passed to `ledcAttachChannel()` is the one to reserve, translated in this way
+* `ledcAttach()` without a channel uses the lowest channel number that the core has not yet used
+* the core reuses a Timer already used by another of its channels with the same frequency and resolution, otherwise it takes the lowest-numbered Timer that none of its channels uses.  Since the core does not know which Timers HomeSpan or you reserved, check which Timer was selected (for example with the debug output of the core) and reserve that one
+
+For this reason, attach your Arduino-based channels first, then reserve the channels and Timers they use, and only then create LedPin and ServoPin objects.
 
 #### Diagnostic Messages
 

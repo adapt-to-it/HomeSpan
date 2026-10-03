@@ -28,6 +28,10 @@ You can add your own log messages to any sketch using HomeSpan's **LOG0()**, **L
 
 Each call to **LOG0()**, **LOG1()**, or **LOG2()** is atomic with respect to all other calls to these macros, even when made from different tasks.  Sketches that write messages from more than one task should therefore use these macros instead of `Serial.print()` or `Serial.printf()` to avoid interleaved output.  Do not use these macros in an ISR (interrupt service routine) context.
 
+* `Utils::logLock()` and `Utils::logUnlock()` - use these two functions to group several consecutive messages (any mix of **LOGn()** macros and `Serial.print()` calls) into a single block that other tasks cannot interrupt.  Every call to `Utils::logLock()` must be matched by a call to `Utils::logUnlock()` from the same task.  The lock is recursive, so **LOGn()** macros and nested `Utils::logLock()` calls made while the lock is held by the same task do not deadlock.  For example: `Utils::logLock(); LOG0("Sensor: "); LOG0(val); LOG0("\n"); Utils::logUnlock();`
+
+  Two cautions apply while the log lock is held.  First, do not call `homeSpanPAUSE` and do not wait for any other lock: the HomeSpan polling task may hold its own lock while waiting for the log lock, which results in a deadlock.  Second, hold the log lock only briefly: until it is released, every **LOGn()** macro in every other task, including the HomeSpan polling task, waits.  This also applies if a write to `Serial` blocks.
+
 See [Example 9 - MessageLogging](Tutorials.md#example-9---messagelogging) for a tutorial sketch demonstrating these macros.
  
 ## Web Logging 

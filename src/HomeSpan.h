@@ -221,6 +221,7 @@ struct SpanWebLog{                            // optional web status/log data
   const char *timeServer=NULL;                // optional time server to use for acquiring clock time
   const char *timeZone;                       // optional time-zone specification
   boolean timeInit=false;                     // flag to indicate time has been initialized
+  boolean sntpByHomeSpan=false;               // flag to indicate SNTP was configured by HomeSpan itself (not by the sketch)
   char bootTime[33]="Unknown";                // boot time
   char *statusURL=NULL;                       // URL of status log
   char *faviconURL=NULL;                      // optional URL for favicon PNG image
@@ -533,7 +534,7 @@ class Span{
 
   TaskHandle_t getAutoPollTask(){return(pollTaskHandle);}
 
-  boolean runInPoll(void (*f)(void *), void *arg=NULL);                      // queues f(arg) to run in the poll task; never blocks; returns false if f is NULL, queue is full, or begin() not yet called; not for use in ISRs
+  boolean runInPoll(void (*f)(void *), void *arg=NULL);                      // queues f(arg) to run in the poll task; never blocks; returns false if f is NULL or queue is full; not for use in ISRs
   Span& setCallbackTask(uint32_t stackSize=4096, uint32_t priority=1, uint32_t core=0);     // creates task to run status, connection, pair, and controller callbacks outside of poll task (only the first call has effect)
 
   Span& setTimeServerTimeout(uint32_t tSec){webLog.waitTime=tSec*1000;return(*this);}    // sets wait time (in seconds) for optional web log time server to connect
@@ -711,34 +712,49 @@ class SpanCharacteristic{
   void uvSet(UVal &u, DATA_t data);                           // copies DATA data into UVal u (after transforming to a char *)
   void uvSet(UVal &u, TLV_ENC_t tlv);                         // copies TLV8 tlv into UVal u (after transforming to a char *)
 
+  UVal uvCopy(UVal &u){                                       // returns copy of numeric UVal u, read under valMux
+    UVal copy;
+    portENTER_CRITICAL(&valMux);
+    copy=u;
+    portEXIT_CRITICAL(&valMux);
+    return(copy);
+  }
+
+  void uvStore(UVal &u, const UVal &src){                     // stores numeric UVal src into u under valMux (byte copy only)
+    portENTER_CRITICAL(&valMux);
+    u=src;
+    portEXIT_CRITICAL(&valMux);
+  }
+
   template <typename T> void uvSet(UVal &u, T val){           // copies numeric val into UVal u  
-    portENTER_CRITICAL(&valMux);                              // only copy bytes inside critical section: no allocation, logging, or library calls
+    UVal t;                                                   // convert outside of critical section (conversions may call soft-float library routines)
+    t.UINT64=0;
     switch(format){
       case FORMAT::BOOL:
-        u.BOOL=(boolean)val;
+        t.BOOL=(boolean)val;
       break;
       case FORMAT::INT:
-        u.INT=(int)val;
+        t.INT=(int)val;
       break;
       case FORMAT::UINT8:
-        u.UINT8=(uint8_t)val;
+        t.UINT8=(uint8_t)val;
       break;
       case FORMAT::UINT16:
-        u.UINT16=(uint16_t)val;
+        t.UINT16=(uint16_t)val;
       break;
       case FORMAT::UINT32:
-        u.UINT32=(uint32_t)val;
+        t.UINT32=(uint32_t)val;
       break;
       case FORMAT::UINT64:
-        u.UINT64=(uint64_t)val;
+        t.UINT64=(uint64_t)val;
       break;
       case FORMAT::FLOAT:
-        u.FLOAT=(double)val;
+        t.FLOAT=(double)val;
       break;
       default:
-      break;
+        return;
     } // switch
-    portEXIT_CRITICAL(&valMux);
+    uvStore(u,t);
   }
  
   char *getStringGeneric(UVal &val);                                      // gets the specified UVal for string-based Characteristics
@@ -747,10 +763,7 @@ class SpanCharacteristic{
   
   template <class T> T uvGet(UVal &u){                                    // gets the specified UVal for numeric-based Characteristics
   
-    UVal copy;                                                            // local copy so that conversion happens outside of critical section
-    portENTER_CRITICAL(&valMux);
-    copy=u;
-    portEXIT_CRITICAL(&valMux);
+    UVal copy=uvCopy(u);                                                  // local copy so that conversion happens outside of critical section
 
     switch(format){   
       case FORMAT::BOOL:
@@ -862,7 +875,7 @@ class SpanCharacteristic{
       }
     
       if(nvsKey){
-        nvs_set_u64(homeSpan.charNVS,nvsKey,value.UINT64);            // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
+        nvs_set_u64(homeSpan.charNVS,nvsKey,uvCopy(value).UINT64);    // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
         nvs_commit(homeSpan.charNVS);
       }
     }
