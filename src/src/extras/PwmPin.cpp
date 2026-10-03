@@ -29,15 +29,27 @@
 
 ///////////////////
 
-LedC::LedC(uint8_t pin, uint16_t freq, boolean invert){
+LedC::LedC(uint8_t pin, uint32_t freq, boolean invert, uint8_t resolution){
 
   if(freq==0)
     freq=DEFAULT_PWM_FREQ;
 
+  int maxRes=LEDC_TIMER_BIT_MAX-1;                                    // find the maximum possible resolution
+  while(80.0e6/(freq*pow(2,maxRes))<1)
+    maxRes--;
+
+  int res=maxRes;
+  if(resolution>0){
+    if(resolution>maxRes)
+      ESP_LOGW(PWM_TAG,"Resolution=%d bits is not possible at Frequency=%lu Hz - using %d bits",resolution,(unsigned long)freq,maxRes);
+    else
+      res=resolution;
+  }
+
   for(int nMode=0;nMode<LEDC_SPEED_MODE_MAX;nMode++){
     for(int nChannel=0;nChannel<LEDC_CHANNEL_MAX;nChannel++){
       for(int nTimer=0;nTimer<LEDC_TIMER_MAX;nTimer++){
-        if(!channelList[nChannel][nMode]){
+        if(!channelList[nChannel][nMode] && !channelReserved[nChannel][nMode] && !timerReserved[nTimer][nMode]){
           
           if(!timerList[nTimer][nMode]){                                // if this timer slot is free, use it
             timerList[nTimer][nMode]=new ledc_timer_config_t();         // create new timer instance
@@ -54,21 +66,16 @@ LedC::LedC(uint8_t pin, uint16_t freq, boolean invert){
             timerList[nTimer][nMode]->deconfigure=false;
 #endif
             
-            
-            int res=LEDC_TIMER_BIT_MAX-1;                               // find the maximum possible resolution
-            while(80.0e6/(freq*pow(2,res))<1)
-              res--;     
-              
             timerList[nTimer][nMode]->duty_resolution=(ledc_timer_bit_t)res;
             if(ledc_timer_config(timerList[nTimer][nMode])!=0){
-              ESP_LOGE(PWM_TAG,"Frequency=%d Hz is out of allowed range ---",freq);
+              ESP_LOGE(PWM_TAG,"Frequency=%lu Hz is out of allowed range ---",(unsigned long)freq);
               delete timerList[nTimer][nMode];
               timerList[nTimer][nMode]=NULL;
               return;              
             }
           }
           
-          if(timerList[nTimer][nMode]->freq_hz==freq){                      // if timer matches desired frequency (always true if newly-created above)
+          if(timerList[nTimer][nMode]->freq_hz==freq && (resolution==0 || timerList[nTimer][nMode]->duty_resolution==res)){     // if timer matches desired frequency and resolution (always true if newly-created above)
             channelList[nChannel][nMode]=new ledc_channel_config_t();       // create new channel instance
             channelList[nChannel][nMode]->speed_mode=(ledc_mode_t)nMode;
             channelList[nChannel][nMode]->channel=(ledc_channel_t)nChannel;
@@ -89,6 +96,42 @@ LedC::LedC(uint8_t pin, uint16_t freq, boolean invert){
 
 ///////////////////
 
+boolean LedC::reserveChannel(ledc_mode_t mode, ledc_channel_t channel){
+
+  if((int)mode<0 || (int)mode>=LEDC_SPEED_MODE_MAX || (int)channel<0 || (int)channel>=LEDC_CHANNEL_MAX){
+    ESP_LOGE(PWM_TAG,"Can't reserve channel=%d, mode=%d - out of range",(int)channel,(int)mode);
+    return(false);
+  }
+
+  if(channelList[channel][mode]){
+    ESP_LOGE(PWM_TAG,"Can't reserve channel=%d, mode=%d - already assigned",(int)channel,(int)mode);
+    return(false);
+  }
+
+  channelReserved[channel][mode]=true;
+  return(true);
+}
+
+///////////////////
+
+boolean LedC::reserveTimer(ledc_mode_t mode, ledc_timer_t timer){
+
+  if((int)mode<0 || (int)mode>=LEDC_SPEED_MODE_MAX || (int)timer<0 || (int)timer>=LEDC_TIMER_MAX){
+    ESP_LOGE(PWM_TAG,"Can't reserve timer=%d, mode=%d - out of range",(int)timer,(int)mode);
+    return(false);
+  }
+
+  if(timerList[timer][mode]){
+    ESP_LOGE(PWM_TAG,"Can't reserve timer=%d, mode=%d - already assigned",(int)timer,(int)mode);
+    return(false);
+  }
+
+  timerReserved[timer][mode]=true;
+  return(true);
+}
+
+///////////////////
+
 void LedC::setDuty(uint32_t duty){
 
   channel->duty=duty;
@@ -104,19 +147,19 @@ void LedC::setDuty(uint32_t duty){
 
 ///////////////////
 
-LedPin::LedPin(uint8_t pin, float level, uint16_t freq, boolean invert) : LedC(pin, freq, invert){
+LedPin::LedPin(uint8_t pin, float level, uint32_t freq, boolean invert, uint8_t resolution) : LedC(pin, freq, invert, resolution){
   
   if(!channel){
     ESP_LOGE(PWM_TAG,"Can't create LedPin(%d) - no open PWM channels and/or Timers",pin);
     return;
   }
   else
-    ESP_LOGI(PWM_TAG,"LedPin=%d: mode=%d, channel=%d, timer=%d, freq=%d Hz, resolution=%d bits %s",
+    ESP_LOGI(PWM_TAG,"LedPin=%d: mode=%d, channel=%d, timer=%d, freq=%lu Hz, resolution=%d bits %s",
       channel->gpio_num,
       channel->speed_mode,
       channel->channel,
       channel->timer_sel,
-      timer->freq_hz,
+      (unsigned long)timer->freq_hz,
       timer->duty_resolution,
       channel->flags.output_invert?"(inverted)":""
       );
@@ -133,6 +176,19 @@ LedPin::LedPin(uint8_t pin, float level, uint16_t freq, boolean invert) : LedC(p
 
 ///////////////////
 
+boolean LedPin::cancelPending(){
+
+  portENTER_CRITICAL(&pendingMux);
+  boolean wasQueued=pendingQueued;
+  pendingValid=false;
+  pendingQueued=false;
+  portEXIT_CRITICAL(&pendingMux);
+
+  return(wasQueued);
+}
+
+///////////////////
+
 void LedPin::set(float level){
 
   if(!channel)
@@ -144,30 +200,32 @@ void LedPin::set(float level){
   if(level<0)
     level=0;
 
-  if(fadeState==FADING){                        // a fade is in progress: stop it by fully re-configuring the channel (same behavior as before)
-    channel->duty=level*maxDuty()/100.0;
+  std::lock_guard<std::recursive_mutex> lock(mux);
+
+  boolean wasQueued=cancelPending();                // a pending request is always discarded
+  uint32_t duty=level*maxDuty()/100.0;
+
+  if(fadeState==FADING && !wasQueued){              // a fade is in progress: stop it
+#if SOC_LEDC_SUPPORT_FADE_STOP
+    ledc_fade_stop(channel->speed_mode,channel->channel);
+    setDuty(duty);
+    fadeState=NOT_FADING;
+#else
+    channel->duty=duty;                             // no fade stop: stop it by fully re-configuring the channel (same behavior as before)
     ledc_channel_config(channel);
+#endif
     return;
   }
 
-  setDuty(level*maxDuty()/100.0);
+  if(wasQueued)                                     // the fade had already ended and its pending successor never started
+    fadeState=NOT_FADING;
+
+  setDuty(duty);
 }
 
 ///////////////////
 
-int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
-
-  if(!channel)
-    return(1);
-
-  if(fadeState==FADING)       // fading already in progress
-    return(1);                // return error
-
-  if(level>100)
-    level=100;
-
-  if(level<0)
-    level=0;
+int LedPin::startFade(float level, uint32_t fadeTime, int fadeType){
 
   float d=level*maxDuty()/100.0;
 
@@ -184,21 +242,200 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
 
 ///////////////////
 
+int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
+
+  if(!channel)
+    return(1);
+
+  if(level>100)
+    level=100;
+
+  if(level<0)
+    level=0;
+
+  std::lock_guard<std::recursive_mutex> lock(mux);
+
+  if(fadeState==FADING){                            // fading already in progress
+#if SOC_LEDC_SUPPORT_FADE_STOP
+    if(ledc_fade_stop(channel->speed_mode,channel->channel)!=ESP_OK)
+      return(1);
+    fadeState=NOT_FADING;
+#else
+    if(!startFadeTask())
+      return(1);
+
+    boolean stored=false;
+    portENTER_CRITICAL(&pendingMux);
+    if(fadeState==FADING){                          // re-check: the fade may have ended in the meantime
+      pendingLevel=level;
+      pendingTime=fadeTime;
+      pendingType=fadeType;
+      pendingValid=true;                            // replaces any previous request
+      stored=true;
+    }
+    portEXIT_CRITICAL(&pendingMux);
+
+    if(stored)
+      return(0);
+#endif
+  }
+
+  return(startFade(level,fadeTime,fadeType));
+}
+
+///////////////////
+
 int LedPin::fadeStatus(){
-  if(fadeState==COMPLETED){
+
+  if(!channel)
+    return(NOT_FADING);
+
+  std::lock_guard<std::recursive_mutex> lock(mux);
+
+  int state=fadeState;
+
+  if(state==COMPLETED){
     fadeState=NOT_FADING;
     return(COMPLETED);
   }
 
-  return(fadeState);
+  return((state==FADING || pendingValid)?FADING:state);
+}
+
+///////////////////
+
+boolean LedPin::isFading(){
+  return(fadeState==FADING || pendingValid);
+}
+
+///////////////////
+
+float LedPin::getLevel(){
+
+  if(!channel || !configured)
+    return(0);
+
+  std::lock_guard<std::recursive_mutex> lock(mux);
+  return(ledc_get_duty(channel->speed_mode,channel->channel)*100.0/maxDuty());
+}
+
+///////////////////
+
+LedPin *LedPin::setFadeCallback(void (*f)(LedPin *, void *), void *arg){
+
+  std::lock_guard<std::recursive_mutex> lock(mux);
+  endCallback=NULL;                                 // disable first, so the ISR never sees a new function with an old argument
+  endArg=arg;
+  endCallback=f;
+  return(this);
 }
 
 ///////////////////
 
 bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
-  ((LedPin *)arg)->fadeState=COMPLETED;
+
+  LedPin *p=(LedPin *)arg;
+  boolean pending;
+
+  portENTER_CRITICAL_ISR(&p->pendingMux);
+  pending=p->pendingValid;
+  if(pending)
+    p->pendingQueued=true;                          // state stays FADING: the ledFade task starts the pending fade
+  else
+    p->fadeState=COMPLETED;
+  portEXIT_CRITICAL_ISR(&p->pendingMux);
+
+  if(!pending){
+    if(p->endCallback)
+      p->endCallback(p,p->endArg);
+    return(false);
+  }
+
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+  BaseType_t woken=pdFALSE;
+  if(fadeQueue && xQueueSendFromISR(fadeQueue,&p,&woken)==pdTRUE)
+    return(woken==pdTRUE);
+
+  portENTER_CRITICAL_ISR(&p->pendingMux);           // queue full: discard the pending request
+  p->pendingValid=false;
+  p->pendingQueued=false;
+  p->fadeState=COMPLETED;
+  portEXIT_CRITICAL_ISR(&p->pendingMux);
+
+  if(p->endCallback)
+    p->endCallback(p,p->endArg);
+#endif
+
   return(false);
 }
+
+///////////////////
+
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+
+static std::mutex fadeTaskMux;
+
+boolean LedPin::startFadeTask(){
+
+  std::lock_guard<std::mutex> lock(fadeTaskMux);
+
+  if(fadeQueue)
+    return(true);
+
+  QueueHandle_t q=xQueueCreate((int)LEDC_CHANNEL_MAX*(int)LEDC_SPEED_MODE_MAX,sizeof(LedPin *));
+  if(!q){
+    ESP_LOGE(PWM_TAG,"Can't create fade queue");
+    return(false);
+  }
+
+  if(xTaskCreate(fadeTask,"ledFade",3072,q,2,NULL)!=pdPASS){
+    vQueueDelete(q);
+    ESP_LOGE(PWM_TAG,"Can't create ledFade task");
+    return(false);
+  }
+
+  fadeQueue=q;
+  return(true);
+}
+
+///////////////////
+
+void LedPin::fadeTask(void *arg){
+
+  QueueHandle_t q=(QueueHandle_t)arg;
+  LedPin *p;
+
+  for(;;){
+    if(xQueueReceive(q,&p,portMAX_DELAY)==pdTRUE)
+      p->startPending();
+  }
+}
+
+///////////////////
+
+void LedPin::startPending(){
+
+  std::lock_guard<std::recursive_mutex> lock(mux);
+
+  float level;
+  uint32_t fadeTime;
+  int fadeType;
+  boolean valid;
+
+  portENTER_CRITICAL(&pendingMux);                  // copy fields only
+  valid=pendingValid;
+  level=pendingLevel;
+  fadeTime=pendingTime;
+  fadeType=pendingType;
+  pendingValid=false;
+  pendingQueued=false;
+  portEXIT_CRITICAL(&pendingMux);
+
+  if(valid)                                         // otherwise set() has cancelled the request
+    startFade(level,fadeTime,fadeType);
+}
+
+#endif
 
 ///////////////////
 
@@ -313,4 +550,9 @@ void ServoPin::set(double degrees){
 
 ledc_channel_config_t *LedC::channelList[LEDC_CHANNEL_MAX][LEDC_SPEED_MODE_MAX]={};
 ledc_timer_config_t *LedC::timerList[LEDC_TIMER_MAX][LEDC_SPEED_MODE_MAX]={};
+boolean LedC::channelReserved[LEDC_CHANNEL_MAX][LEDC_SPEED_MODE_MAX]={};
+boolean LedC::timerReserved[LEDC_TIMER_MAX][LEDC_SPEED_MODE_MAX]={};
 boolean LedPin::fadeInitialized=false;
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+QueueHandle_t LedPin::fadeQueue=NULL;
+#endif
