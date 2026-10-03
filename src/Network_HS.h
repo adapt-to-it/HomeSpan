@@ -30,6 +30,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "Settings.h"
+#include "Utils.h"
 
 const int MAX_SSID=32;                              // max number of characters in WiFi SSID
 const int MAX_PWD=64;                               // max number of characters in WiFi Password
@@ -38,14 +39,15 @@ const int MAX_PWD=64;                               // max number of characters 
 
 struct Network_HS {
 
-  const int MAX_HTTP=4095;                            // max number of bytes in HTTP message
+  static const int MAX_HTTP=4095;                     // max number of bytes in HTTP message
+  static const uint32_t REQUEST_TIMEOUT=1000;         // max time (in milliseconds) to wait for the remainder of an HTTP message split across multiple TCP segments
 
   const char *apSSID=DEFAULT_AP_SSID;                 // Access Point SSID
   const char *apPassword=DEFAULT_AP_PASSWORD;         // Access Point password (does not need to be secret - only used to ensure encrypted WiFi connection)
   unsigned long lifetime=DEFAULT_AP_TIMEOUT*1000;     // length of time (in milliseconds) to keep Access Point alive before shutting down and restarting
   
   char **ssidList=NULL;
-  int numSSID;
+  int numSSID=0;
 
   NetworkClient client;                   // client used for HTTP calls
   unsigned long alarmTimeOut;             // alarm time after which access point is shut down and HomeSpan is re-started
@@ -62,6 +64,7 @@ struct Network_HS {
   void serialConfigure();                                                   // configure homeSpan WiFi from serial monitor
   boolean allowedCode(char *s);                                             // checks if Setup Code is allowed (HAP defines a list of disallowed codes)
   void apConfigure();                                                       // configure homeSpan WiFi and Setup Code using temporary Captive Access Point; only returns if sucessful, else ESP restarts
+  int readRequest(TempBuffer<uint8_t> &httpBuf);                            // read a complete HTTP request into httpBuf; returns number of bytes, or -1 on error
   void processRequest(char *body, char *formData);                          // process the HTTP request
   int badRequestError();                                                    // return 400 error
 

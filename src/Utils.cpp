@@ -187,7 +187,7 @@ boolean PushButton::triggered(uint16_t singleTime, uint16_t longTime, uint16_t d
   switch(status){
     
     case 0:
-      if(doubleCheck && cTime>doubleAlarm){
+      if(doubleCheck && (int32_t)(cTime-doubleAlarm)>0){
         doubleCheck=false;
         pressType=SINGLE;
         return(true);
@@ -209,12 +209,12 @@ boolean PushButton::triggered(uint16_t singleTime, uint16_t longTime, uint16_t d
     case 2:
       if(!triggerType(pin)){         // button is released          
         status=0;
-        if(cTime>singleAlarm){
+        if((int32_t)(cTime-singleAlarm)>0){
           doubleCheck=true;
         }
       } else
       
-      if(cTime>longAlarm){          // button is long-pressed
+      if((int32_t)(cTime-longAlarm)>0){          // button is long-pressed
         longAlarm=cTime+longTime;
         status=3;
         pressType=LONG;
@@ -225,7 +225,7 @@ boolean PushButton::triggered(uint16_t singleTime, uint16_t longTime, uint16_t d
     case 3:
       if(!triggerType(pin))          // button has been released after a long press
         status=0;
-      else if(cTime>longAlarm){
+      else if((int32_t)(cTime-longAlarm)>0){
         longAlarm=cTime+longTime;
         pressType=LONG;
         return(true);        
@@ -237,7 +237,7 @@ boolean PushButton::triggered(uint16_t singleTime, uint16_t longTime, uint16_t d
         status=0;
       } else
       
-      if(cTime>singleAlarm){         // button is still pressed
+      if((int32_t)(cTime-singleAlarm)>0){         // button is still pressed
         status=5;
         pressType=DOUBLE;
         doubleCheck=false;
@@ -275,7 +275,7 @@ boolean PushButton::toggled(uint16_t toggleTime){
         toggleStatus=0;
       }
       
-      else if(cTime>singleAlarm){  // switch has been in CLOSED state for sufficient time
+      else if((int32_t)(cTime-singleAlarm)>0){  // switch has been in CLOSED state for sufficient time
         toggleStatus=2;
         pressType=CLOSED;
         return(true);
@@ -299,7 +299,7 @@ boolean PushButton::toggled(uint16_t toggleTime){
 
 boolean PushButton::primed(){
  
-  if(millis()>singleAlarm && status==1){
+  if(status==1 && (int32_t)(millis()-singleAlarm)>0){
     status=2;
     return(true);
   }

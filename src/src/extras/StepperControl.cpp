@@ -112,14 +112,15 @@ void StepperControl::setPosition(int pos){
 void StepperControl::waitForAck(){
   downLinkData.ack=false;
   while(downLinkData.ack==false)
-    xQueueReceive(downLinkQueue,&downLinkData,0);  
+    xQueueReceive(downLinkQueue,&downLinkData,pdMS_TO_TICKS(10));    // block (rather than spin at 100% CPU) until motor task posts an update
 };
 
 //////////////////////////
 
 StepperControl *StepperControl::brake(){
   move(0,10,BRAKE);
-  while(stepsRemaining());
+  while(stepsRemaining())
+    vTaskDelay(1);                // yield while waiting, rather than spinning
   return(this);
 }
 
@@ -127,7 +128,8 @@ StepperControl *StepperControl::brake(){
 
 StepperControl *StepperControl::disable(){
   move(0,10,DISABLE);
-  while(stepsRemaining());
+  while(stepsRemaining())
+    vTaskDelay(1);                // yield while waiting, rather than spinning
   return(this);
 }
 
@@ -135,7 +137,8 @@ StepperControl *StepperControl::disable(){
 
 StepperControl *StepperControl::enable(){
   move(0,10);
-  while(stepsRemaining());
+  while(stepsRemaining())
+    vTaskDelay(1);                // yield while waiting, rather than spinning
   return(this);  
 }
 

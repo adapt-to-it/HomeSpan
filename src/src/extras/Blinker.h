@@ -52,6 +52,7 @@ class Blinker {
   enum STATUS {OFF, BLINKING, ON};
   
   TaskHandle_t blinkHandle = NULL;
+  SemaphoreHandle_t stopSem = NULL;    // signaled by blink task when it has stopped (so it never touches the LED after stop() returns)
   Blinkable *led;
 
   int nBlinks;
@@ -66,6 +67,8 @@ class Blinker {
 
   static void blinkTask(void *arg);
   static void blinkTaskInverted(void *arg);
+  static boolean wait(int ms);         // waits ms milliseconds; returns true if blink task has been asked to stop
+  static void exitTask(Blinker *b);    // signals stop() and deletes the calling blink task
 
   public:
 

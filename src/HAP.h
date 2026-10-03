@@ -27,7 +27,7 @@
  
 #pragma once
 
-#include <sstream>
+#include <type_traits>
 #include <WiFi.h>
 
 #include "HomeSpan.h"
@@ -88,6 +88,7 @@ struct HAPClient {
   // common structures and data shared across all HAP Clients
 
   static const int MAX_HTTP=8096;                     // max number of bytes allowed for HTTP message
+  static const uint32_t REQUEST_TIMEOUT=1000;         // max time (in milliseconds) to wait for the remainder of an HTTP message that arrives split across multiple TCP segments
   static const int MAX_CONTROLLERS=16;                // maximum number of paired controllers (HAP requires at least 16)
   static const int MAX_ACCESSORIES=150;               // maximum number of allowed Accessories (HAP limit=150)
   
@@ -129,7 +130,7 @@ struct HAPClient {
   int putPrepareURL(char *json);                              // PUT /prepare (HAP Section 6.7.2.4)
 
   void tlvRespond(TLV8 &tlv8);                                // respond to client with HTTP OK header and all defined TLV data records
-  int receiveEncrypted(uint8_t *httpBuf, int messageSize);    // decrypt HTTP request (HAP Section 6.5)
+  int receiveRequest(TempBuffer<uint8_t> &httpBuf);          // receive (and decrypt if needed - HAP Section 6.5) a complete HTTP request into httpBuf; returns number of bytes, or -1 on error
 
   int notFoundError();           // return 404 error
   int badRequestError();         // return 400 error
@@ -164,51 +165,65 @@ struct HAPClient {
 
 /////////////////////////////////////////////////
 // HapOut Structure
+//
+// Lightweight output stream (does NOT derive from std::ostream, which would pull the entire
+// libstdc++ iostream/locale machinery into flash) that buffers text in HAP-sized records (1024 bytes)
+// and can simultaneously print to the Serial Monitor, invoke a user callback, compute a SHA-384 hash,
+// and transmit (with or without encryption) to a HAP Client.
 
-class HapOut : public std::ostream {
+class HapOut {
 
-  private:
+  static const size_t bufSize=1024;       // max allowed for HAP encrypted records
 
-  struct HapStreamBuffer : public std::streambuf {
+  uint8_t *encBuf;                        // single frame buffer: 2-byte AAD + data (encrypted in place) + 16-byte authentication tag
+  char *buffer;                           // start of data portion of encBuf
+  size_t nBuf=0;                          // number of bytes currently in buffer
+  HAPClient *hapClient=NULL;
+  int logLevel=255;                       // default is NOT to print anything
+  boolean enablePrettyPrint=false;
+  size_t byteCount=0;
+  size_t indent=0;
+  uint8_t hash[48];                       // SHA-384 hash output
+  mbedtls_sha512_context *ctx=NULL;       // hash context (only allocated while hashing is enabled)
+  void (*callBack)(const char *, void *)=NULL;
+  void *callBackUserData = NULL;
 
-    const size_t bufSize=1024;            // max allowed for HAP encrypted records
-    char *buffer;
-    uint8_t *encBuf;
-    HAPClient *hapClient=NULL;
-    int logLevel=255;                     // default is NOT to print anything
-    boolean enablePrettyPrint=false;
-    size_t byteCount=0;
-    size_t indent=0;
-    uint8_t *hash;
-    mbedtls_sha512_context *ctx;
-    void (*callBack)(const char *, void *)=NULL;
-    void *callBackUserData = NULL;
-  
-    void flushBuffer();
-    int_type overflow(int_type c) override;
-    int sync() override; 
-    size_t getSize(){return(byteCount+pptr()-pbase());}
-    void printFormatted(char *buf, size_t nChars, size_t nsp);
-        
-    HapStreamBuffer();
-    ~HapStreamBuffer();
-    
-  };
-
-  HapStreamBuffer hapBuffer;
+  void flushBuffer();
+  void printFormatted(char *buf, size_t nChars, size_t nsp);
+  HapOut& printUnsigned(uint64_t val, boolean negative);
 
   public:
 
-  HapOut() : std::ostream(&hapBuffer){}
-  
-  HapOut& setHapClient(HAPClient *hapClient){hapBuffer.hapClient=hapClient;return(*this);}
-  HapOut& setLogLevel(int logLevel){hapBuffer.logLevel=logLevel;return(*this);}
-  HapOut& prettyPrint(){hapBuffer.enablePrettyPrint=true;hapBuffer.logLevel=0;return(*this);}
-  HapOut& setCallback(void(*f)(const char *, void *)){hapBuffer.callBack=f;return(*this);}
-  HapOut& setCallbackUserData(void *userData){hapBuffer.callBackUserData=userData;return(*this);}
-  
-  uint8_t *getHash(){return(hapBuffer.hash);}
-  size_t getSize(){return(hapBuffer.getSize());}
+  HapOut();
+  ~HapOut();
+
+  HapOut& setHapClient(HAPClient *hapClient){this->hapClient=hapClient;return(*this);}
+  HapOut& setLogLevel(int logLevel){this->logLevel=logLevel;return(*this);}
+  HapOut& prettyPrint(){enablePrettyPrint=true;logLevel=0;return(*this);}
+  HapOut& setCallback(void(*f)(const char *, void *)){callBack=f;return(*this);}
+  HapOut& setCallbackUserData(void *userData){callBackUserData=userData;return(*this);}
+  HapOut& enableHash();                                             // computes SHA-384 hash of all output until next flush()
+
+  uint8_t *getHash(){return(hash);}
+  size_t getSize(){return(byteCount+nBuf);}
+
+  HapOut& write(const char *s, size_t n);
+  HapOut& flush();                                                  // transmits any remaining data and resets all settings
+
+  HapOut& operator<<(const char *s){return(s?write(s,strlen(s)):*this);}
+  HapOut& operator<<(char c){return(write(&c,1));}
+  HapOut& operator<<(signed char c){return(write((const char *)&c,1));}
+  HapOut& operator<<(unsigned char c){return(write((const char *)&c,1));}
+
+  template <typename T, typename std::enable_if<std::is_integral<T>::value && !std::is_same<T,char>::value && !std::is_same<T,signed char>::value && !std::is_same<T,unsigned char>::value, int>::type = 0>
+  HapOut& operator<<(T val){                                        // prints any integral type in decimal format
+    if(std::is_signed<T>::value && val<0)
+      return(printUnsigned(-(int64_t)val,true));
+    return(printUnsigned((uint64_t)val,false));
+  }
+
+  template <typename T, typename std::enable_if<std::is_enum<T>::value, int>::type = 0>
+  HapOut& operator<<(T val){return(*this << (int64_t)val);}       // prints enums as integers
 };
 
 /////////////////////////////////////////////////

@@ -55,7 +55,7 @@ SRP6A::SRP6A(){
 
   // load N and g into MPI structures
   
-  mbedtls_mpi_read_string(&N,16,N3072);
+  mbedtls_mpi_read_binary(&N,N3072,sizeof(N3072));     // N is stored in binary form (rather than as a hex string) to save flash and conversion time
   mbedtls_mpi_lset(&g,g3072);
     
 }
@@ -152,12 +152,19 @@ void SRP6A::createPublicKey(const Verification *vData, uint8_t *publicKey){
 
 //////////////////////////////////////
 
-void SRP6A::createSessionKey(const uint8_t *publicKey, size_t len){
+int SRP6A::createSessionKey(const uint8_t *publicKey, size_t len){
+
+  if(len==0 || len>384)                           // A must fit within the 3072-bit group
+    return(0);
+
+  mbedtls_mpi_read_binary(&A,publicKey,len);      // load client PublicKey into A
+
+  mbedtls_mpi_mod_mpi(&t1,&A,&N);                 // SRP-6A safeguard (RFC 5054 Section 2.5.4): abort if A % N == 0, else a malicious client
+  if(mbedtls_mpi_cmp_int(&t1,0)==0)               // could force the shared secret to a known value and complete pairing without the Setup Code
+    return(0);
 
   TempBuffer<uint8_t> tBuf(768);                  // temporary buffer for staging
   TempBuffer<uint8_t> tHash(64);                  // temporary buffer for storing SHA-512 results
-
-  mbedtls_mpi_read_binary(&A,publicKey,len);      // load client PublicKey into A
 
   // compute u = SHA512( PAD(A) | PAD(B) )
   
@@ -177,7 +184,8 @@ void SRP6A::createSessionKey(const uint8_t *publicKey, size_t len){
   
   mbedtls_mpi_write_binary(&S,tBuf,384);          // write S into staging buffer (only first half of buffer will be used)
   mbedtls_sha512(tBuf,384,K,0);                   // create hash of data - this is the SRP SHARED SESSION KEY, K
-  
+
+  return(1);  
 }
 
 //////////////////////////////////////
@@ -219,7 +227,7 @@ int SRP6A::verifyClientProof(const uint8_t *proof){
 
   mbedtls_sha512(tBuf,count,tHash,0);                 // create hash of data - this is M1V
 
-  if(!memcmp(M1,tHash,64))                            // check that client Proof M1 matches M1V
+  if(sodium_memcmp(M1,tHash,64)==0)                   // check that client Proof M1 matches M1V (constant-time comparison)
     return(1);                                        // success - proof from HAP Client is verified
     
   return(0);
@@ -255,6 +263,6 @@ void SRP6A::print(mbedtls_mpi *mpi){
 
 //////////////////////////////////////
 
-constexpr char SRP6A::N3072[];
+constexpr uint8_t SRP6A::N3072[];
 constexpr char SRP6A::I[];
 const uint8_t SRP6A::g3072;

@@ -39,6 +39,7 @@
 #include <esp_wifi.h>
 #include <esp_app_format.h>
 #include <esp_flash.h>
+#include <lwip/sockets.h>
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 3, 2)
   #include <SHA2Builder.h>
@@ -59,7 +60,7 @@ using namespace Utils;
 
 HapOut hapOut;                      // Specialized output stream that can both print to serial monitor and encrypt/transmit to HAP Clients with minimal memory usage (global-scoped variable)
 Span homeSpan;                      // HAP Attributes database and all related control functions for this Accessory (global-scoped variable)
-HapCharacteristics hapChars;        // Instantiation of all HAP Characteristics used to create SpanCharacteristics (global-scoped variable)
+const HapCharacteristics hapChars;  // Instantiation of all HAP Characteristics used to create SpanCharacteristics (global-scoped variable)
 
 ///////////////////////////////
 //        init()             //
@@ -114,7 +115,24 @@ void Span::init(){
   
   networkEventQueue=xQueueCreate(10,sizeof(arduino_event_t));             // queue to transmit network events
   
-  Network.onEvent([](arduino_event_t *event){xQueueSend(homeSpan.networkEventQueue, event, (TickType_t) 0);});
+  Network.onEvent([](arduino_event_t *event){                             // only queue events handled in networkCallback() so that unrelated events cannot fill the queue
+    switch(event->event_id){                                              // and cause critical events (e.g. GOT_IP or DISCONNECTED) to be dropped while poll() is busy
+      case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP6:
+      case ARDUINO_EVENT_WIFI_SCAN_DONE:
+      case ARDUINO_EVENT_ETH_CONNECTED:
+      case ARDUINO_EVENT_ETH_DISCONNECTED:
+      case ARDUINO_EVENT_ETH_GOT_IP:
+      case ARDUINO_EVENT_ETH_GOT_IP6:
+        if(xQueueSend(homeSpan.networkEventQueue, event, (TickType_t) 0)!=pdTRUE)
+          log_w("Network event queue full - event %d dropped",event->event_id);
+      break;
+      default:
+      break;
+    }
+  });
   Network.onEvent([](arduino_event_id_t event){homeSpan.useEthernet();},arduino_event_id_t::ARDUINO_EVENT_ETH_START);   
 }
 
@@ -224,7 +242,7 @@ void Span::pollTask() {
     
   } // isInitialized
 
-  if(!ethernetEnabled && strlen(network.wifiData.ssid) && !(connected%2) && millis()>alarmConnect){
+  if(!ethernetEnabled && strlen(network.wifiData.ssid) && !(connected%2) && (int32_t)(millis()-alarmConnect)>0){                  // rollover-safe comparison
     if(verboseWifiReconnect)
       addWebLog(true,"Trying to connect to %s.  Waiting %ld sec...",network.wifiData.ssid,wifiTimeCounter/1000);
     
@@ -232,7 +250,7 @@ void Span::pollTask() {
     wifiBegin(network.wifiData.ssid,network.wifiData.pwd);
   }
 
-  if(rescanStatus==RESCAN_PENDING && millis()>rescanAlarm){
+  if(rescanStatus==RESCAN_PENDING && (int32_t)(millis()-rescanAlarm)>0){
     rescanStatus=RESCAN_RUNNING;
     LOG2("Rescanning %s for potentially better BSSID...\n",network.wifiData.ssid);
     WiFi.scanDelete();
@@ -255,7 +273,23 @@ void Span::pollTask() {
     auto it=hapList.emplace(hapList.begin());                                // create new HAPClient connection
     it->client=hapServer->accept();
     it->clientNumber=it->client.fd()-LWIP_SOCKET_OFFSET;
-            
+
+    // Tune TCP keep-alive so that connections to controllers that silently disappear (e.g. an iPhone leaving the network) are
+    // detected and closed within about a minute and a half, rather than lingering for hours and exhausting the limited number of sockets.
+    // Also disable Nagle's algorithm so small HAP responses and event notifications are transmitted immediately.
+
+    if(it->client.fd()>=0){
+      int kaVal=1;
+      it->client.setSocketOption(SOL_SOCKET,SO_KEEPALIVE,&kaVal,sizeof(kaVal));
+      kaVal=DEFAULT_TCP_KEEPALIVE_IDLE;
+      it->client.setSocketOption(IPPROTO_TCP,TCP_KEEPIDLE,&kaVal,sizeof(kaVal));
+      kaVal=DEFAULT_TCP_KEEPALIVE_INTERVAL;
+      it->client.setSocketOption(IPPROTO_TCP,TCP_KEEPINTVL,&kaVal,sizeof(kaVal));
+      kaVal=DEFAULT_TCP_KEEPALIVE_COUNT;
+      it->client.setSocketOption(IPPROTO_TCP,TCP_KEEPCNT,&kaVal,sizeof(kaVal));
+      it->client.setNoDelay(true);
+    }
+
     HAPClient::pairStatus=pairState_M1;                                      // reset starting PAIR STATE (which may be needed if Accessory failed in middle of pair-setup)    
 
     LOG2("=======================================\n");
@@ -269,9 +303,9 @@ void Span::pollTask() {
   while(currentClient!=hapList.end()){
     if(currentClient->client.connected()){                                   // if the client is connected
       if(currentClient->client.available()){                                 // if client has data available
-        homeSpan.lastClientIP=currentClient->client.remoteIP().toString();   // store IP Address for web logging
+        strlcpy(homeSpan.lastClientIP,currentClient->client.remoteIP().toString().c_str(),sizeof(homeSpan.lastClientIP));   // store IP Address for web logging
         currentClient->processRequest();                                     // PROCESS HAP REQUEST
-        homeSpan.lastClientIP="0.0.0.0";                                     // reset stored IP address to show "0.0.0.0" if homeSpan.getClientIP() is used in any other context 
+        strcpy(homeSpan.lastClientIP,"0.0.0.0");                             // reset stored IP address to show "0.0.0.0" if homeSpan.getClientIP() is used in any other context 
       }
       if(currentClient->cPair)
         triggerStatus=HS_PAIRED;
@@ -348,7 +382,7 @@ void Span::commandMode(){
   unsigned long alarmTime=millis()+comModeLife;
 
   while(!done){
-    if(millis()>alarmTime){
+    if((int32_t)(millis()-alarmTime)>0){
       LOG0("*** Command Mode: Timed Out (%ld seconds)",comModeLife/1000);
       mode=1;
       done=true;
@@ -523,7 +557,7 @@ IPAddress Span::getUniqueLocalIPv6(NetworkInterface &nif){
   int v6addrs = esp_netif_get_all_ip6(nif.netif(), if_ip6);
   for(int i=0;i<v6addrs;i++){
     if(esp_netif_ip6_get_addr_type(&if_ip6[i])==ESP_IP6_ADDR_IS_UNIQUE_LOCAL)
-    return(IPAddress(IPv6, (const uint8_t *)if_ip6[v6addrs-1].addr, if_ip6[v6addrs-1].zone));
+      return(IPAddress(IPv6, (const uint8_t *)if_ip6[i].addr, if_ip6[i].zone));
   }
   return(IPAddress(IPv6));
 }
@@ -1406,7 +1440,7 @@ void Span::getWebLog(void (*f)(const char *, void *), void *user_data){
 std::pair<HS_STATUS,uint32_t> Span::getStatus(){
 
   std::shared_lock readLock(hsStatusMux);           // wait for mux to be unlocked, or already locked non-exclusively, and then lock *non-exclusively* to prevent another process from writing
-  return{hsStatus, millis()/1000-hsStatusTime};
+  return{hsStatus, (uint32_t)(esp_timer_get_time()/1000000)-hsStatusTime};      // use same 64-bit timer as setStatus() (millis() rolls over after 49.7 days)
 }
 
 ///////////////////////////////
@@ -1414,7 +1448,7 @@ std::pair<HS_STATUS,uint32_t> Span::getStatus(){
 void Span::resetStatusDuration(){
 
   std::unique_lock writeLock(hsStatusMux);        // wait for mux to be unlocked and then lock *exclusively* so write can proceed uninterrupted
-  hsStatusTime=esp_timer_get_time()/1e6;          // reset status time to current time
+  hsStatusTime=esp_timer_get_time()/1000000;      // reset status time to current time
 }
 
 ///////////////////////////////
@@ -1452,7 +1486,7 @@ void Span::setStatus(HS_STATUS hst){
   }
 
   hsStatus=hst;                             // save new status
-  hsStatusTime=esp_timer_get_time()/1e6;    // save timestamp (in seconds) of status change
+  hsStatusTime=esp_timer_get_time()/1000000;    // save timestamp (in seconds) of status change
 
   writeLock.unlock();                       // unlock before calling optional callback
 
@@ -1699,7 +1733,7 @@ boolean Span::updateCharacteristics(char *buf, SpanBufVec &pVec){
       LOG0("\n*** ERROR:  Timed Write PID not found\n\n");
       twFail=true;
     } else        
-    if(millis()>TimedWrites[pid]){
+    if((int32_t)(millis()-TimedWrites[pid])>0){
       LOG0("\n*** ERROR:  Timed Write Expired\n\n");
       twFail=true;
     }        
@@ -1887,8 +1921,10 @@ void Span::printfAttributes(SpanBufVec &pVec){
     if(it!=pVec.begin())
       hapOut << ",";
     hapOut << "{\"aid\":" << (*it).aid << ",\"iid\":" << (*it).iid << ",\"status\":" << (int)(*it).status;
-    if((*it).status==StatusCode::OK && (*it).wr && (*it).characteristic)
-      hapOut << ",\"value\":" << (*it).characteristic->uvPrint((*it).characteristic->value).c_str();
+    if((*it).status==StatusCode::OK && (*it).wr && (*it).characteristic){
+      hapOut << ",\"value\":";
+      (*it).characteristic->uvStream((*it).characteristic->value);
+    }
     hapOut << "}";
   }
 
@@ -1967,8 +2003,9 @@ Span& Span::resetIID(uint32_t newIID){
 
 boolean Span::updateDatabase(boolean updateMDNS){
 
-  printfAttributes(GET_META|GET_PERMS|GET_TYPE|GET_DESC);   // stream attributes database, which automtically produces a SHA-384 hash
-  hapOut.flush();  
+  hapOut.enableHash();                                      // compute SHA-384 hash of streamed output
+  printfAttributes(GET_META|GET_PERMS|GET_TYPE|GET_DESC);   // stream attributes database to produce hash
+  hapOut.flush();
 
   boolean changed=false;
 
@@ -2012,7 +2049,7 @@ const char *Span::getPairingInfo(char **buf){
   size_t olen;
   TempBuffer<char> tBuf(256);
   mbedtls_base64_encode((uint8_t *)tBuf.get(),256,&olen,(uint8_t *)&HAPClient::accessory,sizeof(struct Accessory));
-  asprintf(buf,tBuf.get());
+  asprintf(buf,"%s",tBuf.get());
   return(*buf);
 }
 
@@ -2126,8 +2163,8 @@ SpanService::~SpanService(){
   auto pb=homeSpan.PushButtons.begin();         // loop through PushButton vector and delete ALL PushButtons associated with this Service
   while(pb!=homeSpan.PushButtons.end()){
     if((*pb)->service==this){
+      LOG1("Deleted PushButton on Pin=%d\n",(*pb)->pin);        // log BEFORE erasing (after erase, pb points to the next element, or end())
       pb=homeSpan.PushButtons.erase(pb);
-      LOG1("Deleted PushButton on Pin=%d\n",(*pb)->pin);
     }
     else {
       pb++;
@@ -2195,7 +2232,7 @@ void SpanService::printfAttributes(int flags){
 //    SpanCharacteristic     //
 ///////////////////////////////
 
-SpanCharacteristic::SpanCharacteristic(HapChar *hapChar, boolean isCustom){
+SpanCharacteristic::SpanCharacteristic(const HapChar *hapChar, boolean isCustom){
 
   type=hapChar->type;
   perms=hapChar->perms;
@@ -2270,6 +2307,41 @@ String SpanCharacteristic::uvPrint(UVal &u){
 
 ///////////////////////////////
 
+void SpanCharacteristic::uvStream(UVal &u){
+  char c[32];
+  switch(format){
+    case FORMAT::BOOL:
+      hapOut << (u.BOOL?'1':'0');
+      return;
+    case FORMAT::INT:
+      hapOut << u.INT;
+      return;
+    case FORMAT::UINT8:
+      hapOut << (uint32_t)u.UINT8;
+      return;
+    case FORMAT::UINT16:
+      hapOut << u.UINT16;
+      return;
+    case FORMAT::UINT32:
+      hapOut << u.UINT32;
+      return;
+    case FORMAT::UINT64:
+      hapOut << u.UINT64;
+      return;
+    case FORMAT::FLOAT:
+      snprintf(c,sizeof(c),"%g",u.FLOAT);
+      hapOut << c;
+      return;
+    case FORMAT::STRING:
+    case FORMAT::DATA:
+    case FORMAT::TLV_ENC:
+      hapOut << '"' << u.STRING << '"';
+      return;
+  } // switch
+}
+
+///////////////////////////////
+
 void SpanCharacteristic::uvSet(UVal &dest, UVal &src){
   if(format>=FORMAT::STRING)
     uvSet(dest,(const char *)src.STRING);
@@ -2291,11 +2363,11 @@ void SpanCharacteristic::uvSet(UVal &u, DATA_t data){
   if(data.second>0){
     size_t olen;
     mbedtls_base64_encode(NULL,0,&olen,NULL,data.second);                              // get length of string buffer needed (mbedtls includes the trailing null in this size)
-    value.STRING = (char *)HS_REALLOC(value.STRING,olen);                              // allocate sufficient size for storing value
-    mbedtls_base64_encode((uint8_t*)value.STRING,olen,&olen,data.first,data.second );  // encode data into string buf
+    u.STRING = (char *)HS_REALLOC(u.STRING,olen);                                      // allocate sufficient size for storing value
+    mbedtls_base64_encode((uint8_t*)u.STRING,olen,&olen,data.first,data.second );      // encode data into string buf
   } else {
-    value.STRING = (char *)HS_REALLOC(value.STRING,1);                                 // allocate sufficient size for just trailing null character
-    *value.STRING ='\0';
+    u.STRING = (char *)HS_REALLOC(u.STRING,1);                                         // allocate sufficient size for just trailing null character
+    *u.STRING ='\0';
   }  
 }
 
@@ -2438,8 +2510,7 @@ void SpanCharacteristic::setValFinish(boolean notify){
       SpanBuf sb;                             // create SpanBuf object
       sb.characteristic=this;                 // set characteristic          
       sb.status=StatusCode::OK;               // set status
-      char dummy[]="";
-      sb.val=dummy;                           // set dummy "val" so that printfNotify knows to consider this "update"
+      sb.val=const_cast<char *>("");             // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
       homeSpan.Notifications.push_back(sb);   // store SpanBuf in Notifications vector
     }
 
@@ -2454,8 +2525,8 @@ void SpanCharacteristic::setValFinish(boolean notify){
 
 void SpanCharacteristic::printfAttributes(int flags){
 
-  const char permCodes[][7]={"pr","pw","ev","aa","tw","hd","wr"};
-  const char formatCodes[][9]={"bool","uint8","uint16","uint32","uint64","int","float","string","data","tlv8"};
+  static const char permCodes[][3]={"pr","pw","ev","aa","tw","hd","wr"};
+  static const char formatCodes[][7]={"bool","uint8","uint16","uint32","uint64","int","float","string","data","tlv8"};
 
   hapOut << "{\"iid\":" << iid;
 
@@ -2465,18 +2536,25 @@ void SpanCharacteristic::printfAttributes(int flags){
   if((perms&PR) && (flags&GET_VALUE)){    
     if(perms&NV && !(flags&GET_NV))
       hapOut << ",\"value\":null";
-    else
-      hapOut << ",\"value\":" << uvPrint(value).c_str();
+    else{
+      hapOut << ",\"value\":";
+      uvStream(value);
+    }
   }
 
   if(flags&GET_META){
     hapOut << ",\"format\":\"" << formatCodes[format] << "\"";
     
     if(customRange && (flags&GET_META)){
-      hapOut << ",\"minValue\":" << uvPrint(minValue).c_str() << ",\"maxValue\":" << uvPrint(maxValue).c_str();
+      hapOut << ",\"minValue\":";
+      uvStream(minValue);
+      hapOut << ",\"maxValue\":";
+      uvStream(maxValue);
         
-      if(uvGet<float>(stepValue)>0)
-        hapOut << ",\"minStep\":" << uvPrint(stepValue).c_str();
+      if(uvGet<float>(stepValue)>0){
+        hapOut << ",\"minStep\":";
+        uvStream(stepValue);
+      }
     }
 
     if(unit){
@@ -2514,10 +2592,8 @@ void SpanCharacteristic::printfAttributes(int flags){
   if(flags&GET_AID)
     hapOut << ",\"aid\":" << aid;
 
-  HAPClient *hc=&(*(homeSpan.currentClient));
-  
-  if(flags&GET_EV)
-    hapOut << ",\"ev\":" << (evList.has(hc)?"true":"false");
+  if(flags&GET_EV)                                             // only dereference currentClient when needed (it is not valid outside of processing a client request)
+    hapOut << ",\"ev\":" << (evList.has(&(*(homeSpan.currentClient)))?"true":"false");
 
   if(flags&GET_STATUS)
     hapOut << ",\"status\":0";    
@@ -2669,12 +2745,16 @@ uint32_t SpanCharacteristic::getAID(){
 
 boolean SpanCharacteristic::foundIn(const char *getCharList){
 
-  char *charID;
+  char charID[24];
+  int n=snprintf(charID,sizeof(charID),"%lu.%lu",getAID(),getIID());
 
-  asprintf(&charID,"%lu.%lu",getAID(),getIID());
-  boolean res=strstr(getCharList,charID);
-  free(charID);
-  return(res);
+  for(const char *p=getCharList;(p=strstr(p,charID));p++){         // match only complete IDs (e.g. "1.1" should not match "1.10" or "11.1")
+    boolean startOK=(p==getCharList || !(isdigit(p[-1]) || p[-1]=='.'));
+    boolean endOK=!(isdigit(p[n]) || p[n]=='.');
+    if(startOK && endOK)
+      return(true);
+  }
+  return(false);
 }
 
 ///////////////////////////////
@@ -2912,7 +2992,7 @@ void SpanWebLog::vLog(boolean sysMsg, const char *fmt, va_list ap){
     log[index].message=(char *)HS_REALLOC(log[index].message, strlen(buf) + 1);
     strcpy(log[index].message, buf);
     
-    log[index].clientIP=homeSpan.lastClientIP;  
+    strlcpy(log[index].clientIP,homeSpan.lastClientIP,sizeof(log[index].clientIP));
     nEntries++;
   }
 

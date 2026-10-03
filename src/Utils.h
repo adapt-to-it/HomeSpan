@@ -85,6 +85,16 @@ class TempBuffer {
     free(buf);
   }
 
+  void resize(size_t _nElements){                                         // resizes buffer (preserving existing contents up to new size)
+    bufType *p=(bufType *)HS_REALLOC(buf,_nElements*sizeof(bufType));
+    if(p==NULL){
+      Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",_nElements*sizeof(bufType));
+      while(1);
+    }
+    buf=p;
+    nElements=_nElements;
+  }
+
   int len(){
     return(nElements*sizeof(bufType));
   }

@@ -43,9 +43,16 @@ void Network_HS::scan(){
   homeSpan.setStatus(HS_WIFI_SCANNING);
   int n=WiFi.scanNetworks();
 
+  for(int i=0;ssidList && i<numSSID;i++)      // free any previous scan results
+    free(ssidList[i]);
   free(ssidList);
-  ssidList=(char **)HS_CALLOC(n,sizeof(char *));
+  ssidList=NULL;
   numSSID=0;
+
+  if(n<=0)                                    // no networks found, or scan failed
+    return;
+
+  ssidList=(char **)HS_CALLOC(n,sizeof(char *));
 
   for(int i=0;i<n;i++){
     boolean found=false;
@@ -144,7 +151,7 @@ void Network_HS::apConfigure(){
       homeSpan.reboot();
     }
 
-    if(millis()>alarmTimeOut){
+    if((int32_t)(millis()-alarmTimeOut)>0){
       WiFi.softAPdisconnect(true);           // terminate connections and shut down captive access point
       delay(100);
       if(apStatus==1){
@@ -180,25 +187,15 @@ void Network_HS::apConfigure(){
       LOG2(client.remoteIP());
       LOG2(" <<<<<<<<<\n");
 
-      int messageSize=client.available();        
-
-      if(messageSize>MAX_HTTP){            // exceeded maximum number of bytes allowed
-        badRequestError();
-        LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",messageSize,MAX_HTTP);
-        continue;
-      } 
-
-      TempBuffer<uint8_t> httpBuf(messageSize+1);      // leave room for null character added below
+      TempBuffer<uint8_t> httpBuf(client.available()+1);      // initial size based on bytes already available (grows as needed)
     
-      int nBytes=client.read(httpBuf,messageSize);       // read all available bytes up to maximum allowed+1
+      int nBytes=readRequest(httpBuf);                         // read complete HTTP message, which may span multiple TCP segments
       
-      if(nBytes!=messageSize || client.available()!=0){
+      if(nBytes<0){
         badRequestError();
-        LOG0("\n*** ERROR:  HTTP message not read correctly.  Expected %d bytes, read %d bytes, %d bytes remaining\n\n",messageSize,nBytes,client.available());
         continue;
       }
     
-      httpBuf[nBytes]='\0';                       // add null character to enable string functions    
       char *body=(char *)httpBuf.get();                 // char pointer to start of HTTP Body
       char *p;                                          // char pointer used for searches
       
@@ -234,6 +231,66 @@ void Network_HS::apConfigure(){
     homeSpan.resetWatchdog();
   } // while 1
 
+}
+
+///////////////////////////////
+
+int Network_HS::readRequest(TempBuffer<uint8_t> &httpBuf){
+
+  // Reads a complete HTTP message (header plus any content specified by Content-Length) into httpBuf, growing httpBuf as
+  // needed and waiting up to REQUEST_TIMEOUT milliseconds for any portion of the message that has not yet arrived.
+  // Returns total number of bytes (with a null terminator added after last byte), or -1 on error.
+
+  int nBytes=0;
+  int msgLen=-1;
+  uint32_t lastData=millis();
+
+  while(msgLen<0 || nBytes<msgLen){
+
+    int avail=client.available();
+
+    if(avail<=0){
+      if(!client.connected() || millis()-lastData>REQUEST_TIMEOUT){
+        LOG0("\n*** ERROR:  Incomplete HTTP message (%d bytes received)\n\n",nBytes);
+        return(-1);
+      }
+      delay(1);
+      continue;
+    }
+
+    lastData=millis();
+
+    if(nBytes+avail>MAX_HTTP){
+      LOG0("\n*** ERROR:  HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
+      return(-1);
+    }
+
+    httpBuf.resize(nBytes+avail+1);
+    int n=client.read(httpBuf+nBytes,avail);
+    if(n<=0){
+      LOG0("\n*** ERROR:  HTTP message not read correctly\n\n");
+      return(-1);
+    }
+    nBytes+=n;
+    httpBuf[nBytes]='\0';
+
+    if(msgLen<0){
+      char *p=strstr((char *)httpBuf.get(),"\r\n\r\n");
+      if(p){
+        *p='\0';
+        char *q=strstr((char *)httpBuf.get(),"Content-Length: ");
+        int cLen=q?atoi(q+16):0;
+        *p='\r';
+        msgLen=(p-(char *)httpBuf.get())+4+(cLen>0?cLen:0);
+        if(msgLen>MAX_HTTP){
+          LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",msgLen,MAX_HTTP);
+          return(-1);
+        }
+      }
+    }
+  }
+
+  return(nBytes);
 }
 
 ///////////////////////////////
@@ -302,7 +359,7 @@ void Network_HS::processRequest(char *body, char *formData){
       responseHead+="Refresh: " + String(homeSpan.wifiTimeCounter/1000) + "\r\n";     
       responseBody+="<p>Re-initiating connection to:</p><p><b>" + String(wifiData.ssid) + "</b></p>";
       responseBody+="<p>(waiting " + String((homeSpan.wifiTimeCounter++)/1000) + " seconds to check for response)</p>";
-      responseBody+="<p>Access Point termination in " + String((alarmTimeOut-millis())/1000) + " seconds.</p>";
+      responseBody+="<p>Access Point termination in " + String((int32_t)(alarmTimeOut-millis())/1000) + " seconds.</p>";
       responseBody+="<center><button onclick=\"document.location='/hotspot-detect.html'\">Cancel</button></center>";
       WiFi.begin(wifiData.ssid,wifiData.pwd);
       
@@ -391,8 +448,11 @@ int Network_HS::getFormValue(const char *formData, const char *tag, char *value,
   while(*v!='\0' && *v!='&' && len<maxSize){      // copy the value until null, '&', or maxSize is reached
     if(*v=='%'){                                  // this is an escaped character of form %XX
       v++;
-      sscanf(v,"%2x",(unsigned int *)value++);
-      v+=2;
+      unsigned int c=0;
+      sscanf(v,"%2x",&c);                         // decode into a full-size integer (NOT directly into value, which would overflow the buffer)
+      *value++=c;
+      for(int i=0;i<2 && *v!='\0';i++)           // advance past hex digits without skipping over a premature terminator
+        v++;
     } else {
       *value++=(*v=='+'?' ':*v);                  // HTML Forms use '+' for spaces (and '+' signs are escaped)
       v++;

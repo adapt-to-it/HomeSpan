@@ -110,47 +110,25 @@ void HAPClient::init(){
 
 void HAPClient::processRequest(){
 
-  int nBytes, messageSize;
-
-  messageSize=client.available();        
-
-  if(messageSize>MAX_HTTP){                         // exceeded maximum number of bytes allowed
-    badRequestError();
-    LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",messageSize,MAX_HTTP);
-    return;
-  }
- 
-  TempBuffer<uint8_t> httpBuf(messageSize+1);      // leave room for null character added below
-  
   if(cPair){                                       // expecting encrypted message
     LOG2("<<<< #### ");
     LOG2(client.remoteIP());
     LOG2(" #### <<<<\n");
-
-    nBytes=receiveEncrypted(httpBuf,messageSize);  // decrypt and return number of bytes read      
-        
-    if(!nBytes){                                   // decryption failed (error message already printed in function)
-      badRequestError();              
-      return;          
-    }
-        
-  } else {                                         // expecting plaintext message  
+  } else {                                         // expecting plaintext message
     LOG2("<<<<<<<<< ");
     LOG2(client.remoteIP());
     LOG2(" <<<<<<<<<\n");
-    
-    nBytes=client.read(httpBuf,messageSize);       // read expected number of bytes
+  }
 
-    if(nBytes!=messageSize || client.available()!=0){
-      badRequestError();
-      LOG0("\n*** ERROR:  HTTP message not read correctly.  Expected %d bytes, read %d bytes, %d bytes remaining\n\n",messageSize,nBytes,client.available());
-      return;
-    }
-               
-  } // encrypted/plaintext
-      
-  httpBuf[nBytes]='\0';   // add null character to enable string functions
-      
+  TempBuffer<uint8_t> httpBuf(client.available()+1);  // initial size based on bytes already available (buffer grows as needed)
+
+  int nBytes=receiveRequest(httpBuf);                 // read (and decrypt if needed) a complete HTTP message, which may span multiple TCP segments and HAP frames
+
+  if(nBytes<0){                                       // error (message already printed in function)
+    badRequestError();
+    return;
+  }
+
   char *body=(char *)httpBuf.get();   // char pointer to start of HTTP Body
   char *p;                            // char pointer used for searches
      
@@ -401,9 +379,8 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
         return(0);
       };
 
-      srp->createSessionKey(*itPublicKey,itPublicKey->getLen());              // create session key, K, from client Public Key, A
-
-      if(!srp->verifyClientProof(*itClientProof)){                            // verify client Proof, M1
+      if(!srp->createSessionKey(*itPublicKey,itPublicKey->getLen()) ||        // create session key, K, from client Public Key, A (fails if A is invalid)
+         !srp->verifyClientProof(*itClientProof)){                            // verify client Proof, M1
         LOG0("\n*** ERROR: SRP Proof Verification Failed\n\n");
         responseTLV.add(kTLVType_Error,tagError_Authentication);              // set Error=Authentication
         tlvRespond(responseTLV);                                              // send response to client
@@ -428,7 +405,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
       auto itEncryptedData=iosTLV.find(kTLVType_EncryptedData);
 
-      if(iosTLV.len(itEncryptedData)<=0){            
+      if(iosTLV.len(itEncryptedData)<=(int)crypto_aead_chacha20poly1305_IETF_ABYTES){      // must be longer than the 16-byte authentication tag (else computed length of decrypted data underflows)          
         LOG0("\n*** ERROR: Required 'EncryptedData' TLV record for this step is bad or missing\n\n");
         responseTLV.add(kTLVType_Error,tagError_Unknown);               // set Error=Unknown (there is no specific error type for missing/bad TLV data)
         tlvRespond(responseTLV);                                        // send response to client
@@ -648,7 +625,7 @@ int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
 
       auto itEncryptedData=iosTLV.find(kTLVType_EncryptedData);
 
-      if(iosTLV.len(itEncryptedData)<=0){            
+      if(iosTLV.len(itEncryptedData)<=(int)crypto_aead_chacha20poly1305_IETF_ABYTES){      // must be longer than the 16-byte authentication tag (else computed length of decrypted data underflows)          
         LOG0("\n*** ERROR: Required 'EncryptedData' TLV record for this step is bad or missing\n\n");
         responseTLV.add(kTLVType_State,pairState_M4);               // set State=<M4>
         responseTLV.add(kTLVType_Error,tagError_Unknown);           // set Error=Unknown (there is no specific error type for missing/bad TLV data)
@@ -1193,7 +1170,7 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
       else
         sprintf(clocktime,"Unknown");        
       
-      hapOut << "<tr><td>" << i+1 << "</td><td>" << uptime << "</td><td>" << clocktime << "</td><td>" << homeSpan.webLog.log[index].clientIP.c_str() << "</td><td>" << homeSpan.webLog.log[index].message << "</td></tr>\n";
+      hapOut << "<tr><td>" << i+1 << "</td><td>" << uptime << "</td><td>" << clocktime << "</td><td>" << homeSpan.webLog.log[index].clientIP << "</td><td>" << homeSpan.webLog.log[index].message << "</td></tr>\n";
     }
     hapOut << "</table>\n";
   }
@@ -1226,7 +1203,7 @@ void HAPClient::checkTimedWrites(){
 
   auto tw=homeSpan.TimedWrites.begin();
   while(tw!=homeSpan.TimedWrites.end()){
-    if(cTime>tw->second){                                             // timer has expired
+    if((int32_t)(cTime-tw->second)>0){                                // timer has expired (rollover-safe comparison)
        LOG2("Removing PID=%llu  ALARM=%lu\n",tw->first,tw->second);
        tw=homeSpan.TimedWrites.erase(tw);
       }
@@ -1266,12 +1243,10 @@ void HAPClient::eventNotify(SpanBufVec &pVec, HAPClient *ignore){
 
 void HAPClient::tlvRespond(TLV8 &tlv8){
 
-  tlv8.osprint(hapOut);
-  size_t nBytes=hapOut.getSize();
-  hapOut.flush();
-  
-  char *body;
-  asprintf(&body,"HTTP/1.1 200 OK\r\nContent-Type: application/pairing+tlv8\r\nContent-Length: %d\r\n\r\n",nBytes);      // create Body with Content Length = size of TLV data
+  size_t nBytes=tlv8.pack_size();                  // size of packed TLV data
+
+  char body[128];
+  snprintf(body,sizeof(body),"HTTP/1.1 200 OK\r\nContent-Type: application/pairing+tlv8\r\nContent-Length: %d\r\n\r\n",nBytes);      // create Body with Content Length = size of TLV data
 
   LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",client.remoteIP().toString().c_str());
   LOG2(body);
@@ -1280,7 +1255,11 @@ void HAPClient::tlvRespond(TLV8 &tlv8){
 
   hapOut.setHapClient(this);
   hapOut << body;
-  tlv8.osprint(hapOut);
+
+  uint8_t tBuf[64];                                 // pack TLV records directly into hapOut in small chunks
+  tlv8.pack_init();
+  while((nBytes=tlv8.pack(tBuf,sizeof(tBuf)))>0)
+    hapOut.write((const char *)tBuf,nBytes);
   hapOut.flush();
 
   if(!cPair)
@@ -1288,47 +1267,106 @@ void HAPClient::tlvRespond(TLV8 &tlv8){
   else
     LOG2("-------- SENT ENCRYPTED! --------\n");
 
-  free(body);
-  
 } // tlvRespond
 
 //////////////////////////////////////
 
-int HAPClient::receiveEncrypted(uint8_t *httpBuf, int messageSize){
+int HAPClient::receiveRequest(TempBuffer<uint8_t> &httpBuf){
 
-  uint8_t aad[2];
-  int nBytes=0;
+  // Reads a complete HTTP message (header plus any content specified by Content-Length) into httpBuf, growing
+  // httpBuf as needed.  Messages may arrive split across multiple TCP segments (and, for encrypted sessions,
+  // multiple HAP frames), so rather than failing when only part of a message is available, wait up to
+  // REQUEST_TIMEOUT milliseconds for the remainder to arrive.  Returns total number of bytes, or -1 on error.
+  // A null terminator is always added after the last byte.
 
-  while(client.read(aad,2)==2){    // read initial 2-byte AAD record
+  int nBytes=0;                     // total number of (decrypted) bytes received
+  int msgLen=-1;                    // total expected length of HTTP message (unknown until full header received)
+  uint32_t lastData=millis();       // time of most recent data received
 
-    int n=aad[0]+aad[1]*256;                // compute number of bytes expected in message after decoding
+  while(msgLen<0 || nBytes<msgLen){
 
-    if(nBytes+n>messageSize){      // exceeded maximum number of bytes allowed in plaintext message
-      LOG0("\n\n*** ERROR:  Decrypted message of %d bytes exceeded maximum expected message length of %d bytes\n\n",nBytes+n,messageSize);
-      return(0);
+    int avail=client.available();
+
+    if(avail<=0){                                                 // no data available (yet)
+      if(!client.connected() || millis()-lastData>REQUEST_TIMEOUT){
+        LOG0("\n*** ERROR:  Incomplete HTTP message (%d bytes received%s)\n\n",nBytes,client.connected()?" before timeout":" before client disconnected");
+        return(-1);
       }
-
-    TempBuffer<uint8_t> tBuf(n+16);      // expected number of total bytes = n bytes in encoded message + 16 bytes for appended authentication tag      
-
-    if(client.read(tBuf,tBuf.len())!=tBuf.len()){      
-      LOG0("\n\n*** ERROR: Malformed encrypted message frame\n\n");
-      return(0);      
-    }                
-
-    if(crypto_aead_chacha20poly1305_ietf_decrypt(httpBuf+nBytes, NULL, NULL, tBuf, tBuf.len(), aad, 2, c2aNonce.get(), c2aKey)==-1){
-      LOG0("\n\n*** ERROR: Can't Decrypt Message\n\n");
-      return(0);        
+      delay(1);
+      continue;
     }
 
-    c2aNonce.inc();
+    lastData=millis();
 
-    nBytes+=n;          // increment total number of bytes in plaintext message
-    
+    if(cPair){                                                    // encrypted session: read next frame
+      uint8_t aad[2];
+      if(client.readBytes(aad,2)!=2){                             // read initial 2-byte AAD record
+        LOG0("\n*** ERROR:  Malformed encrypted message frame (missing AAD)\n\n");
+        return(-1);
+      }
+
+      int n=aad[0]+aad[1]*256;                                    // compute number of bytes expected in frame after decoding
+
+      if(nBytes+n>MAX_HTTP){                                      // exceeded maximum number of bytes allowed in plaintext message
+        LOG0("\n*** ERROR:  Decrypted HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
+        return(-1);
+      }
+
+      TempBuffer<uint8_t> tBuf(n+16);                             // expected number of total bytes = n bytes in encoded message + 16 bytes for appended authentication tag
+
+      if(client.readBytes(tBuf.get(),tBuf.len())!=tBuf.len()){    // readBytes() waits (up to Stream timeout) for any part of the frame that has not yet arrived
+        LOG0("\n*** ERROR:  Malformed encrypted message frame\n\n");
+        return(-1);
+      }
+
+      httpBuf.resize(nBytes+n+1);                                 // leave room for null terminator
+
+      if(crypto_aead_chacha20poly1305_ietf_decrypt(httpBuf+nBytes, NULL, NULL, tBuf, tBuf.len(), aad, 2, c2aNonce.get(), c2aKey)==-1){
+        LOG0("\n*** ERROR:  Can't Decrypt Message\n\n");
+        return(-1);
+      }
+
+      c2aNonce.inc();
+      nBytes+=n;                                                  // increment total number of bytes in plaintext message
+
+    } else {                                                      // plaintext session: read all available bytes
+
+      if(nBytes+avail>MAX_HTTP){                                  // exceeded maximum number of bytes allowed
+        LOG0("\n*** ERROR:  HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
+        return(-1);
+      }
+
+      httpBuf.resize(nBytes+avail+1);                             // leave room for null terminator
+      int n=client.read(httpBuf+nBytes,avail);
+      if(n<=0){
+        LOG0("\n*** ERROR:  HTTP message not read correctly\n\n");
+        return(-1);
+      }
+      nBytes+=n;
+    }
+
+    httpBuf[nBytes]='\0';                                         // add null terminator to enable string functions
+
+    if(msgLen<0){                                                 // end of header not yet found
+      char *p=strstr((char *)httpBuf.get(),"\r\n\r\n");
+      if(p){                                                      // found end of header
+        *p='\0';                                                  // temporarily terminate header to restrict search for Content-Length
+        char *q=strstr((char *)httpBuf.get(),"Content-Length: ");
+        int cLen=q?atoi(q+16):0;
+        *p='\r';                                                  // restore header
+        msgLen=(p-(char *)httpBuf.get())+4+(cLen>0?cLen:0);       // total expected length = header + blank line + content
+        if(msgLen>MAX_HTTP){
+          LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",msgLen,MAX_HTTP);
+          return(-1);
+        }
+      }
+    }
+
   } // while
 
   return(nBytes);
-    
-} // receiveEncrypted
+
+} // receiveRequest
 
 /////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////
@@ -1515,39 +1553,79 @@ void Nonce::inc(){
 //////////////////////////////////////
 //////////////////////////////////////
 
-HapOut::HapStreamBuffer::HapStreamBuffer(){
+HapOut::HapOut(){
 
   // note - must require all memory allocation to be pulled from INTERNAL heap only
 
-  const uint32_t caps=MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL;
-
-  buffer=(char *)heap_caps_malloc(bufSize+1,caps);                                          // add 1 for adding null terminator when printing text
-  encBuf=(uint8_t *)heap_caps_malloc(bufSize+18,caps);                                      // 2-byte AAD + encrypted data + 16-byte authentication tag 
-  hash=(uint8_t *)heap_caps_malloc(48,caps);                                                // space for SHA-384 hash output
-  ctx = (mbedtls_sha512_context *)heap_caps_malloc(sizeof(mbedtls_sha512_context),caps);    // space for hash context
-  
-  mbedtls_sha512_init(ctx);                 // initialize context
-  mbedtls_sha512_starts(ctx,1);             // start SHA-384 hash (note second argument=1)
-  
-  setp(buffer, buffer+bufSize-1);           // assign buffer pointers
+  encBuf=(uint8_t *)heap_caps_malloc(bufSize+18,MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL);     // 2-byte AAD + data + 16-byte authentication tag (also leaves room for null terminator after data)
+  buffer=(char *)encBuf+2;                                                                    // data is stored directly after AAD so it can be encrypted in place
+  memset(hash,0,sizeof(hash));
 }
 
 //////////////////////////////////////
 
-HapOut::HapStreamBuffer::~HapStreamBuffer(){
+HapOut::~HapOut(){
 
-  sync();
-  free(buffer);
+  flush();
   free(encBuf);
-  free(hash);
-  free(ctx);
 }
 
 //////////////////////////////////////
 
-void HapOut::HapStreamBuffer::flushBuffer(){
-  
-  int num=pptr()-pbase();
+HapOut& HapOut::enableHash(){
+
+  if(!ctx){
+    ctx=(mbedtls_sha512_context *)heap_caps_malloc(sizeof(mbedtls_sha512_context),MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL);
+    mbedtls_sha512_init(ctx);               // initialize context
+    mbedtls_sha512_starts(ctx,1);           // start SHA-384 hash (note second argument=1)
+  }
+  return(*this);
+}
+
+//////////////////////////////////////
+
+HapOut& HapOut::write(const char *s, size_t n){
+
+  while(n>0){
+    size_t nCopy=bufSize-nBuf;
+    if(nCopy>n)
+      nCopy=n;
+    memcpy(buffer+nBuf,s,nCopy);
+    nBuf+=nCopy;
+    s+=nCopy;
+    n-=nCopy;
+    if(nBuf==bufSize)                       // buffer is full - transmit a complete HAP record
+      flushBuffer();
+  }
+  return(*this);
+}
+
+//////////////////////////////////////
+
+HapOut& HapOut::printUnsigned(uint64_t val, boolean negative){
+
+  char c[21];
+  char *p=c+sizeof(c);
+
+  if(val<=UINT32_MAX){                      // use faster 32-bit arithmetic whenever possible
+    uint32_t v=val;
+    do{ *--p='0'+v%10; v/=10; } while(v);
+  } else {
+    do{ *--p='0'+val%10; val/=10; } while(val);
+  }
+
+  if(negative)
+    *--p='-';
+
+  return(write(p,c+sizeof(c)-p));
+}
+
+//////////////////////////////////////
+
+void HapOut::flushBuffer(){
+
+  size_t num=nBuf;
+  nBuf=0;
 
   byteCount+=num;
 
@@ -1560,70 +1638,68 @@ void HapOut::HapStreamBuffer::flushBuffer(){
     if(enablePrettyPrint)                         // if pretty print needed, use formatted method
       printFormatted(buffer,num,2);
     else                                          // if not, just print
-    Serial.print(buffer);         
+      Serial.print(buffer);
   }
-  
-  if(hapClient!=NULL){
-    if(!hapClient->cPair){                        // if not encrypted 
-      hapClient->client.write(buffer,num);        // transmit data buffer
-      
+
+  if(ctx)
+    mbedtls_sha512_update(ctx,(uint8_t *)buffer,num);       // update hash (must be done BEFORE any in-place encryption below)
+
+  if(hapClient!=NULL && num>0){
+    size_t nSent, nExpected;
+
+    if(!hapClient->cPair){                        // if not encrypted
+      nExpected=num;
+      nSent=hapClient->client.write(buffer,num);  // transmit data buffer
+
     } else {                                      // if encrypted
-      
+
       encBuf[0]=num%256;                          // store number of bytes that encrypts this frame (AAD bytes)
       encBuf[1]=num/256;
-      crypto_aead_chacha20poly1305_ietf_encrypt(encBuf+2,NULL,(uint8_t *)buffer,num,encBuf,2,NULL,hapClient->a2cNonce.get(),hapClient->a2cKey);   // encrypt buffer with AAD prepended and authentication tag appended
-      
-      hapClient->client.write(encBuf,num+18);     // transmit encrypted frame
-      hapClient->a2cNonce.inc();                  // increment nonce
+      crypto_aead_chacha20poly1305_ietf_encrypt(encBuf+2,NULL,encBuf+2,num,encBuf,2,NULL,hapClient->a2cNonce.get(),hapClient->a2cKey);   // encrypt buffer in place with AAD prepended and authentication tag appended
+
+      nExpected=num+18;
+      nSent=hapClient->client.write(encBuf,nExpected);     // transmit encrypted frame
+      hapClient->a2cNonce.inc();                           // increment nonce
     }
-    delay(1);
+
+    if(nSent!=nExpected && hapClient->client.connected()){     // a partially-transmitted frame corrupts the HAP session (and indicates the peer is unresponsive), so close the connection rather than stalling on every subsequent frame
+      LOG0("\n*** ERROR:  Transmitted only %d of %d bytes to Client #%d.  Closing connection.\n\n",nSent,nExpected,hapClient->clientNumber);
+      hapClient->client.stop();
+    }
   }
-
-  mbedtls_sha512_update(ctx,(uint8_t *)buffer,num);       // update hash
-
-  pbump(-num);                                            // reset buffer pointers
-}
-
-//////////////////////////////////////
-        
-std::streambuf::int_type HapOut::HapStreamBuffer::overflow(std::streambuf::int_type c){
-  
-  if(c!=EOF){
-    *pptr() = c;
-    pbump(1);
-  }
-
-  flushBuffer();
-  return(c);
 }
 
 //////////////////////////////////////
 
-int HapOut::HapStreamBuffer::sync(){
+HapOut& HapOut::flush(){
 
   flushBuffer();
-  
+
   logLevel=255;
   hapClient=NULL;
   enablePrettyPrint=false;
   byteCount=0;
   indent=0;
-  
+
   if(callBack){
     callBack(NULL,callBackUserData);
     callBack=NULL;
     callBackUserData=NULL;
   }
 
-  mbedtls_sha512_finish(ctx,hash);    // finish SHA-384 and store hash
-  mbedtls_sha512_starts(ctx,1);       // re-start hash for next time
+  if(ctx){
+    mbedtls_sha512_finish(ctx,hash);    // finish SHA-384 and store hash
+    mbedtls_sha512_free(ctx);
+    free(ctx);
+    ctx=NULL;
+  }
 
-  return(0);
+  return(*this);
 }
 
 //////////////////////////////////////
 
-void HapOut::HapStreamBuffer::printFormatted(char *buf, size_t nChars, size_t nsp){
+void HapOut::printFormatted(char *buf, size_t nChars, size_t nsp){
   
   for(int i=0;i<nChars;i++){
     switch(buf[i]){
