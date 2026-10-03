@@ -35,7 +35,7 @@ LedC::LedC(uint8_t pin, uint32_t freq, boolean invert, uint8_t resolution){
     freq=DEFAULT_PWM_FREQ;
 
   int maxRes=LEDC_TIMER_BIT_MAX-1;                                    // find the maximum possible resolution
-  while(80.0e6/(freq*pow(2,maxRes))<1)
+  while(maxRes>1 && 80.0e6/(freq*pow(2,maxRes))<1)    // stops at 1: ledc_timer_config rejects frequencies that are too high
     maxRes--;
 
   int res=maxRes;
@@ -232,6 +232,8 @@ int LedPin::startFade(float level, uint32_t fadeTime, int fadeType){
   if(fadeType==PROPORTIONAL)
     fadeTime*=fabs((float)ledc_get_duty(channel->speed_mode,channel->channel)-d)/(float)maxDuty();
 
+  fadeStartMs=millis();
+  fadeDurationMs=fadeTime;
   fadeState=FADING;
   if(ledc_set_fade_time_and_start(channel->speed_mode,channel->channel,d,fadeTime,LEDC_FADE_NO_WAIT)!=ESP_OK){
     fadeState=NOT_FADING;
@@ -254,6 +256,12 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
     level=0;
 
   std::lock_guard<std::recursive_mutex> lock(mux);
+
+  if(fadeOverdue()){                                // the end-of-fade callback never arrived: consider the fade finished
+    ESP_LOGW(PWM_TAG,"LedPin=%d: fade end not detected - assuming fade is finished",channel->gpio_num);
+    cancelPending();
+    fadeState=NOT_FADING;
+  }
 
   if(fadeState==FADING){                            // fading already in progress
 #if SOC_LEDC_SUPPORT_FADE_STOP
@@ -292,6 +300,11 @@ int LedPin::fadeStatus(){
 
   std::lock_guard<std::recursive_mutex> lock(mux);
 
+  if(fadeOverdue()){                                // the end-of-fade callback never arrived: consider the fade finished
+    cancelPending();
+    fadeState=NOT_FADING;
+  }
+
   int state=fadeState;
 
   if(state==COMPLETED){
@@ -305,6 +318,8 @@ int LedPin::fadeStatus(){
 ///////////////////
 
 boolean LedPin::isFading(){
+  if(fadeOverdue())                                 // read-only check: same rule as fade(), without changing the state
+    return(false);
   return(fadeState==FADING || pendingValid);
 }
 
@@ -324,9 +339,10 @@ float LedPin::getLevel(){
 LedPin *LedPin::setFadeCallback(void (*f)(LedPin *, void *), void *arg){
 
   std::lock_guard<std::recursive_mutex> lock(mux);
-  endCallback=NULL;                                 // disable first, so the ISR never sees a new function with an old argument
-  endArg=arg;
+  portENTER_CRITICAL(&pendingMux);                  // function and argument change together, as seen by the ISR
   endCallback=f;
+  endArg=arg;
+  portEXIT_CRITICAL(&pendingMux);
   return(this);
 }
 
@@ -338,6 +354,8 @@ bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
   boolean pending;
 
   portENTER_CRITICAL_ISR(&p->pendingMux);
+  void (*cb)(LedPin *, void *)=p->endCallback;      // read once, together with its argument
+  void *cbArg=p->endArg;
   pending=p->pendingValid;
   if(pending)
     p->pendingQueued=true;                          // state stays FADING: the ledFade task starts the pending fade
@@ -346,8 +364,8 @@ bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
   portEXIT_CRITICAL_ISR(&p->pendingMux);
 
   if(!pending){
-    if(p->endCallback)
-      p->endCallback(p,p->endArg);
+    if(cb)
+      cb(p,cbArg);
     return(false);
   }
 
@@ -362,8 +380,8 @@ bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
   p->fadeState=COMPLETED;
   portEXIT_CRITICAL_ISR(&p->pendingMux);
 
-  if(p->endCallback)
-    p->endCallback(p,p->endArg);
+  if(cb)
+    cb(p,cbArg);
 #endif
 
   return(false);
@@ -423,15 +441,17 @@ void LedPin::startPending(){
   boolean valid;
 
   portENTER_CRITICAL(&pendingMux);                  // copy fields only
-  valid=pendingValid;
+  valid=pendingValid && pendingQueued;             // a request not yet handed over by the ISR must wait for the current fade to end
   level=pendingLevel;
   fadeTime=pendingTime;
   fadeType=pendingType;
-  pendingValid=false;
-  pendingQueued=false;
+  if(valid){
+    pendingValid=false;
+    pendingQueued=false;
+  }
   portEXIT_CRITICAL(&pendingMux);
 
-  if(valid)                                         // otherwise set() has cancelled the request
+  if(valid)                                         // otherwise the request was cancelled or is not yet startable (stale queue entry)
     startFade(level,fadeTime,fadeType);
 }
 

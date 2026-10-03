@@ -72,7 +72,9 @@ struct FadingLED : Service::LightBulb {
     // Below we turn LED fully on or off depending on whether power is on
     // Unlike above, we will NOT wait for the fading to complete, but will return immediately
     
-    if(ledPin->fade(100-(power->getVal())*100,2000,LedPin::PROPORTIONAL)!=0)            // use fade to either turn fully on or fully off; check return status to see if call was successful
+    // Calling fade() while a fade is in progress changes the destination of the fade, so we use isFading() to ignore button presses until the current fade is completed
+    
+    if(ledPin->isFading() || ledPin->fade(100-(power->getVal())*100,2000,LedPin::PROPORTIONAL)!=0)    // use fade to either turn fully on or fully off; check return status to see if call was successful
       Serial.printf("Button Press Ignored\n");
   }
 
