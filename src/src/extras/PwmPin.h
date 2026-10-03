@@ -113,7 +113,9 @@ class LedPin : public LedC {
     void *endArg=NULL;
     volatile uint32_t fadeStartMs=0;                                   // millis() when the last fade was started
     volatile uint32_t fadeDurationMs=0;                                // duration of the last fade, in milliseconds
-    boolean fadeOverdue(){return(fadeState==FADING && (uint32_t)(millis()-fadeStartMs)>fadeDurationMs+250);}   // true if the end of a fade was not detected (read-only)
+    // Fade end is considered missed only after 2x the requested time (the ledc.h notes of ledc_set_fade_with_time() say the actual duration can be up to 2x longer
+    // than requested), plus one PWM cycle, plus a 500 ms margin. 64-bit math avoids overflow with very large fade times. Read-only.
+    boolean fadeOverdue(){return(fadeState==FADING && (uint64_t)(uint32_t)(millis()-fadeStartMs)>2*(uint64_t)fadeDurationMs+(1000+(uint64_t)getFreq()-1)/getFreq()+500);}
 
     static bool fadeCallback(const ledc_cb_param_t *param, void *arg);
     static boolean fadeInitialized;
