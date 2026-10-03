@@ -32,7 +32,7 @@
 //
 //  Contains various generic utility functions and classes:
 //
-//  Utils::readSerial       - reads all characters from Serial port and saves only up to max specified
+//  Utils::readSerial       - reads all characters from Serial port and saves only up to max specified (with optional idle timeout)
 //  Utils::mask             - masks a string with asterisks (good for displaying passwords)
 //  Utils::resetReason      - returns literal string description of esp_reset_reason()
 //
@@ -41,7 +41,7 @@
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-char *Utils::readSerial(char *c, int max){
+char *Utils::readSerial(char *c, int max, uint32_t idleTimeout){
 
   if(homeSpan.getSerialInputDisable()){
     c[0]='\0';
@@ -50,13 +50,20 @@ char *Utils::readSerial(char *c, int max){
   
   int i=0;
   char buf;
+  uint32_t t0=millis();                   // time of entry or of last character received
 
   while(1){
 
-    while(!Serial.available())            // wait until there is a new character
+    while(!Serial.available()){           // wait until there is a new character
       homeSpan.resetWatchdog();
+      if(idleTimeout>0 && millis()-t0>idleTimeout){     // idle timeout expired - discard what has been read
+        c[0]='\0';
+        return(c);
+      }
+    }
     
     buf=Serial.read();
+    t0=millis();
     
     if(buf=='\n'){         // exit upon newline
       if(i>0)              // characters have been typed
@@ -324,6 +331,7 @@ void PushButton::wait(){
 
 void PushButton::reset(){
   status=0;
+  doubleCheck=false;
 }
 
 //////////////////////////////////////

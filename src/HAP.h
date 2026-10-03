@@ -88,7 +88,8 @@ struct HAPClient {
   // common structures and data shared across all HAP Clients
 
   static const int MAX_HTTP=8096;                     // max number of bytes allowed for HTTP message
-  static const uint32_t REQUEST_TIMEOUT=1000;         // max time (in milliseconds) to wait for the remainder of an HTTP message that arrives split across multiple TCP segments
+  static const int MAX_PAIRING_TLV=1024;              // max number of bytes allowed for the TLV content of an (unauthenticated) pair-setup or pair-verify request
+  static const uint32_t REQUEST_TIMEOUT=5000;         // max time (in milliseconds) a partially received HTTP message may remain incomplete before the connection is closed (does not block polling)
   static const int MAX_CONTROLLERS=16;                // maximum number of paired controllers (HAP requires at least 16)
   static const int MAX_ACCESSORIES=150;               // maximum number of allowed Accessories (HAP limit=150)
   
@@ -118,6 +119,18 @@ struct HAPClient {
   Nonce a2cNonce;                 // encryption nonce (starts at zero at end of each Pair-Verify and increment every encryption - NOT DOCUMENTED)
   Nonce c2aNonce;                 // decryption nonce (starts at zero at end of each Pair-Verify and increment every encryption - NOT DOCUMENTED)
 
+  // state of the HTTP message currently being received (persists between polls so receiveRequest() never has to wait)
+
+  TempBuffer<uint8_t> httpBuf;    // plaintext HTTP message accumulated so far
+  int rxBytes=0;                  // number of plaintext bytes in httpBuf
+  int rxMsgLen=-1;                // total expected length of HTTP message (-1 until end of header is found)
+  TempBuffer<uint8_t> frameBuf;   // encrypted frame being received (data plus authentication tag)
+  int frameLen=-1;                // plaintext length of frame being received (-1 if frame length not yet known)
+  int frameBytes=0;               // number of bytes of frameBuf received so far
+  uint8_t aad[2];                 // 2-byte AAD (frame length) of frame being received
+  int aadBytes=0;                 // number of AAD bytes received so far
+  uint32_t rxTime=0;              // time (in milliseconds) data was last received
+
   // define member methods
 
   void processRequest();                                      // process HAP request  
@@ -130,7 +143,9 @@ struct HAPClient {
   int putPrepareURL(char *json);                              // PUT /prepare (HAP Section 6.7.2.4)
 
   void tlvRespond(TLV8 &tlv8);                                // respond to client with HTTP OK header and all defined TLV data records
-  int receiveRequest(TempBuffer<uint8_t> &httpBuf);          // receive (and decrypt if needed - HAP Section 6.5) a complete HTTP request into httpBuf; returns number of bytes, or -1 on error
+  int receiveRequest();                                       // receive (without waiting) and decrypt if needed - HAP Section 6.5 - the next part of an HTTP request into httpBuf; returns number of bytes if message is complete, 0 if incomplete, or -1 on error
+  void resetRequest();                                        // clear state of partially or completely received HTTP request
+  void checkRequestTimeout();                                 // close connection if a partially received HTTP request has been stalled longer than REQUEST_TIMEOUT
 
   int notFoundError();           // return 404 error
   int badRequestError();         // return 400 error

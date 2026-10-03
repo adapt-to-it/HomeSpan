@@ -94,8 +94,8 @@ void LedC::setDuty(uint32_t duty){
   channel->duty=duty;
 
   if(!configured){                                                    // first call requires full configuration of channel (including GPIO)
-    ledc_channel_config(channel);
-    configured=true;
+    if(ledc_channel_config(channel)==ESP_OK)
+      configured=true;
   } else {                                                            // subsequent calls only need to update duty (much faster, and glitch-free since update occurs at start of next PWM cycle)
     ledc_set_duty(channel->speed_mode,channel->channel,duty);
     ledc_update_duty(channel->speed_mode,channel->channel);
@@ -175,7 +175,10 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
     fadeTime*=fabs((float)ledc_get_duty(channel->speed_mode,channel->channel)-d)/(float)maxDuty();
 
   fadeState=FADING;
-  ledc_set_fade_time_and_start(channel->speed_mode,channel->channel,d,fadeTime,LEDC_FADE_NO_WAIT);
+  if(ledc_set_fade_time_and_start(channel->speed_mode,channel->channel,d,fadeTime,LEDC_FADE_NO_WAIT)!=ESP_OK){
+    fadeState=NOT_FADING;
+    return(1);
+  }
   return(0);
 }
 
@@ -215,6 +218,9 @@ void LedPin::HSVtoRGB(float h, float s, float v, float *r, float *g, float *b ){
     return;
   }
   
+  h=fmodf(h,360);
+  if(h<0)
+    h+=360;
   h /= 60;
   i = floor( h ) ;
   f = h - i;

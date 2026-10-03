@@ -110,23 +110,29 @@ void HAPClient::init(){
 
 void HAPClient::processRequest(){
 
-  if(cPair){                                       // expecting encrypted message
-    LOG2("<<<< #### ");
-    LOG2(client.remoteIP());
-    LOG2(" #### <<<<\n");
-  } else {                                         // expecting plaintext message
-    LOG2("<<<<<<<<< ");
-    LOG2(client.remoteIP());
-    LOG2(" <<<<<<<<<\n");
-  }
+  int nBytes=receiveRequest();                        // read (and decrypt if needed) the next part of an HTTP message, which may span multiple TCP segments and HAP frames
 
-  TempBuffer<uint8_t> httpBuf(client.available()+1);  // initial size based on bytes already available (buffer grows as needed)
+  if(nBytes==0)                                       // message not yet complete - nothing to do until more data arrives
+    return;
 
-  int nBytes=receiveRequest(httpBuf);                 // read (and decrypt if needed) a complete HTTP message, which may span multiple TCP segments and HAP frames
+  struct RequestGuard {                               // clears receive state on every exit path below
+    HAPClient *hc;
+    ~RequestGuard(){hc->resetRequest();}
+  } requestGuard={this};
 
   if(nBytes<0){                                       // error (message already printed in function)
     badRequestError();
     return;
+  }
+
+  if(cPair){                                       // received encrypted message
+    LOG2("<<<< #### ");
+    LOG2(client.remoteIP());
+    LOG2(" #### <<<<\n");
+  } else {                                         // received plaintext message
+    LOG2("<<<<<<<<< ");
+    LOG2(client.remoteIP());
+    LOG2(" <<<<<<<<<\n");
   }
 
   char *body=(char *)httpBuf.get();   // char pointer to start of HTTP Body
@@ -288,6 +294,12 @@ int HAPClient::unauthorizedError(){
 
 int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
+  if(len>MAX_PAIRING_TLV){                                      // reject oversized content before unpacking, since unpacking allocates a list node per TLV record
+    LOG0("\n*** ERROR: Pairing TLV of %d bytes exceeds maximum allowed (%d)\n\n",(int)len,MAX_PAIRING_TLV);
+    badRequestError();                                          // return with 400 error, which closes connection
+    return(0);
+  }
+
   static SRP6A *srp=NULL;   // must persist across multiple calls to postPairSetupURL
 
   HAPTLV iosTLV;
@@ -319,9 +331,12 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
     return(0);
   };
 
+  if(tlvState==pairState_M1)                                        // an M1 request always restarts the pair-setup sequence
+    pairStatus=pairState_M1;
+
   LOG1("Found <M%d>.  Expected <M%d>.\n",tlvState,pairStatus);
 
-  if(tlvState!=pairStatus){                                         // error: Device is not yet paired, but out-of-sequence pair-setup STATE was received
+  if(tlvState!=pairStatus || (tlvState!=pairState_M1 && srp==NULL)){                                         // error: Device is not yet paired, but out-of-sequence pair-setup STATE was received
     LOG0("\n*** ERROR: Out-of-Sequence Pair-Setup request!\n\n");
     responseTLV.add(kTLVType_State,tlvState+1);                     // set response STATE to requested state+1 (which should match the state that was expected by the controller)
     responseTLV.add(kTLVType_Error,tagError_Unknown);               // set Error=Unknown (there is no specific error type for out-of-sequence steps)
@@ -515,6 +530,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
       delete srp;                                           // delete SRP - no longer needed once pairing is completed
       srp=NULL;                                             // reset to NULL
+      pairStatus=pairState_M1;                              // reset pairStatus to first step
 
       mdns_service_txt_item_set("_hap","_tcp","sf","0");    // broadcast new status
       
@@ -538,6 +554,12 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 //////////////////////////////////////
 
 int HAPClient::postPairVerifyURL(uint8_t *content, size_t len){
+
+  if(len>MAX_PAIRING_TLV){                                      // reject oversized content before unpacking, since unpacking allocates a list node per TLV record
+    LOG0("\n*** ERROR: Pairing TLV of %d bytes exceeds maximum allowed (%d)\n\n",(int)len,MAX_PAIRING_TLV);
+    badRequestError();                                          // return with 400 error, which closes connection
+    return(0);
+  }
 
   HAPTLV iosTLV;
   HAPTLV responseTLV;
@@ -925,8 +947,10 @@ int HAPClient::getCharacteristicsURL(char *urlBuf){
     }
   } // parse URL
 
-  if(!numIDs)           // could not find any IDs
+  if(!numIDs){          // could not find any IDs
+    badRequestError();  // return with 400 error, which closes connection
     return(0);
+  }
 
   LOG2("\n>>>>>>>>>> %s >>>>>>>>>>\n",client.remoteIP().toString().c_str());
 
@@ -957,8 +981,10 @@ int HAPClient::putCharacteristicsURL(char *json){
 
   SpanBufVec pVec;
    
-  if(!homeSpan.updateCharacteristics(json, pVec))         // perform update and check for success
+  if(!homeSpan.updateCharacteristics(json, pVec)){        // perform update and check for success
+    badRequestError();                                    // return with 400 error, which closes connection
     return(0);                                            // return if failed to update (error message will have been printed in update)
+  }
 
   boolean multiCast=false;
   for(auto it=pVec.begin();it!=pVec.end() && !multiCast;it++)   // for each characteristic, check if any status is either NOT OKAY, or if WRITE-RESPONSE is requested
@@ -986,6 +1012,8 @@ int HAPClient::putCharacteristicsURL(char *json){
   }
 
   LOG2("\n-------- SENT ENCRYPTED! --------\n");
+
+  homeSpan.saveCharacteristics(pVec);                     // save values in NVS now that the response has been sent
 
   // Create and send Event Notifications if needed
 
@@ -1016,7 +1044,7 @@ int HAPClient::putPrepareURL(char *json){
     sscanf(cBuf+strlen(ttlToken),"%lu",&ttl);
 
   if((cBuf=strstr(json,pidToken)))
-    sscanf(cBuf+strlen(ttlToken),"%llu",&pid);
+    sscanf(cBuf+strlen(pidToken),"%llu",&pid);
 
   StatusCode status=StatusCode::OK;
 
@@ -1271,102 +1299,139 @@ void HAPClient::tlvRespond(TLV8 &tlv8){
 
 //////////////////////////////////////
 
-int HAPClient::receiveRequest(TempBuffer<uint8_t> &httpBuf){
+int HAPClient::receiveRequest(){
 
-  // Reads a complete HTTP message (header plus any content specified by Content-Length) into httpBuf, growing
-  // httpBuf as needed.  Messages may arrive split across multiple TCP segments (and, for encrypted sessions,
-  // multiple HAP frames), so rather than failing when only part of a message is available, wait up to
-  // REQUEST_TIMEOUT milliseconds for the remainder to arrive.  Returns total number of bytes, or -1 on error.
-  // A null terminator is always added after the last byte.
+  // Reads whatever part of an HTTP message is currently available, without waiting.  State is kept in the HAPClient
+  // so a message split across multiple TCP segments (and, for encrypted sessions, multiple HAP frames) is reassembled
+  // over successive calls.  Returns total number of bytes if the message is complete, 0 if it is still incomplete,
+  // or -1 on error.  A null terminator is always added after the last byte.
 
-  int nBytes=0;                     // total number of (decrypted) bytes received
-  int msgLen=-1;                    // total expected length of HTTP message (unknown until full header received)
-  uint32_t lastData=millis();       // time of most recent data received
+  int avail=client.available();
 
-  while(msgLen<0 || nBytes<msgLen){
+  if(avail<=0)                                                    // no data available now
+    return(0);
 
-    int avail=client.available();
+  if(cPair){                                                      // encrypted session
 
-    if(avail<=0){                                                 // no data available (yet)
-      if(!client.connected() || millis()-lastData>REQUEST_TIMEOUT){
-        LOG0("\n*** ERROR:  Incomplete HTTP message (%d bytes received%s)\n\n",nBytes,client.connected()?" before timeout":" before client disconnected");
-        return(-1);
-      }
-      delay(1);
-      continue;
-    }
+    if(frameLen<0){                                               // frame length not yet known: read 2-byte AAD record, possibly across multiple calls
 
-    lastData=millis();
-
-    if(cPair){                                                    // encrypted session: read next frame
-      uint8_t aad[2];
-      if(client.readBytes(aad,2)!=2){                             // read initial 2-byte AAD record
-        LOG0("\n*** ERROR:  Malformed encrypted message frame (missing AAD)\n\n");
-        return(-1);
+      while(aadBytes<2){
+        int n=client.read(aad+aadBytes,2-aadBytes);
+        if(n<0){
+          LOG0("\n*** ERROR:  Malformed encrypted message frame (missing AAD)\n\n");
+          return(-1);
+        }
+        if(n==0)
+          return(0);
+        aadBytes+=n;
+        rxTime=millis();
       }
 
-      int n=aad[0]+aad[1]*256;                                    // compute number of bytes expected in frame after decoding
+      frameLen=aad[0]+aad[1]*256;                                 // compute number of bytes expected in frame after decoding
 
-      if(nBytes+n>MAX_HTTP){                                      // exceeded maximum number of bytes allowed in plaintext message
+      if(rxBytes+frameLen>MAX_HTTP){                              // exceeded maximum number of bytes allowed in plaintext message
         LOG0("\n*** ERROR:  Decrypted HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
         return(-1);
       }
 
-      TempBuffer<uint8_t> tBuf(n+16);                             // expected number of total bytes = n bytes in encoded message + 16 bytes for appended authentication tag
+      frameBuf.resize(frameLen+16);                               // n bytes in encoded message + 16 bytes for appended authentication tag
+      frameBytes=0;
+    }
 
-      if(client.readBytes(tBuf.get(),tBuf.len())!=tBuf.len()){    // readBytes() waits (up to Stream timeout) for any part of the frame that has not yet arrived
+    while(frameBytes<frameBuf.len()){
+      int n=client.read(frameBuf.get()+frameBytes,frameBuf.len()-frameBytes);
+      if(n<0){
         LOG0("\n*** ERROR:  Malformed encrypted message frame\n\n");
         return(-1);
       }
-
-      httpBuf.resize(nBytes+n+1);                                 // leave room for null terminator
-
-      if(crypto_aead_chacha20poly1305_ietf_decrypt(httpBuf+nBytes, NULL, NULL, tBuf, tBuf.len(), aad, 2, c2aNonce.get(), c2aKey)==-1){
-        LOG0("\n*** ERROR:  Can't Decrypt Message\n\n");
-        return(-1);
-      }
-
-      c2aNonce.inc();
-      nBytes+=n;                                                  // increment total number of bytes in plaintext message
-
-    } else {                                                      // plaintext session: read all available bytes
-
-      if(nBytes+avail>MAX_HTTP){                                  // exceeded maximum number of bytes allowed
-        LOG0("\n*** ERROR:  HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
-        return(-1);
-      }
-
-      httpBuf.resize(nBytes+avail+1);                             // leave room for null terminator
-      int n=client.read(httpBuf+nBytes,avail);
-      if(n<=0){
-        LOG0("\n*** ERROR:  HTTP message not read correctly\n\n");
-        return(-1);
-      }
-      nBytes+=n;
+      if(n==0)
+        return(0);
+      frameBytes+=n;
+      rxTime=millis();
     }
 
-    httpBuf[nBytes]='\0';                                         // add null terminator to enable string functions
+    httpBuf.resize(rxBytes+frameLen+1);                           // frame is complete; leave room for null terminator
 
-    if(msgLen<0){                                                 // end of header not yet found
-      char *p=strstr((char *)httpBuf.get(),"\r\n\r\n");
-      if(p){                                                      // found end of header
-        *p='\0';                                                  // temporarily terminate header to restrict search for Content-Length
-        char *q=strstr((char *)httpBuf.get(),"Content-Length: ");
-        int cLen=q?atoi(q+16):0;
-        *p='\r';                                                  // restore header
-        msgLen=(p-(char *)httpBuf.get())+4+(cLen>0?cLen:0);       // total expected length = header + blank line + content
-        if(msgLen>MAX_HTTP){
-          LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",msgLen,MAX_HTTP);
-          return(-1);
-        }
-      }
+    if(crypto_aead_chacha20poly1305_ietf_decrypt(httpBuf+rxBytes, NULL, NULL, frameBuf, frameBuf.len(), aad, 2, c2aNonce.get(), c2aKey)==-1){
+      LOG0("\n*** ERROR:  Can't Decrypt Message\n\n");
+      return(-1);
     }
 
-  } // while
+    c2aNonce.inc();
+    rxBytes+=frameLen;                                            // increment total number of bytes in plaintext message
+    frameLen=-1;                                                  // clear frame state
+    frameBytes=0;
+    aadBytes=0;
+    frameBuf.resize(1);
 
-  return(nBytes);
+  } else {                                                        // plaintext session: read all available bytes
+
+    if(rxBytes+avail>MAX_HTTP){                                   // exceeded maximum number of bytes allowed
+      LOG0("\n*** ERROR:  HTTP message exceeds maximum allowed (%d bytes)\n\n",MAX_HTTP);
+      return(-1);
+    }
+
+    httpBuf.resize(rxBytes+avail+1);                              // leave room for null terminator
+    int n=client.read(httpBuf+rxBytes,avail);
+    if(n<0){
+      LOG0("\n*** ERROR:  HTTP message not read correctly\n\n");
+      return(-1);
+    }
+    if(n==0)
+      return(0);
+    rxBytes+=n;
+    rxTime=millis();
+  }
+
+  httpBuf[rxBytes]='\0';                                          // add null terminator to enable string functions
+
+  if(rxMsgLen<0){                                                 // end of header not yet found
+    char *p=strstr((char *)httpBuf.get(),"\r\n\r\n");
+    if(p){                                                        // found end of header
+      *p='\0';                                                    // temporarily terminate header to restrict search for Content-Length
+      char *q=strstr((char *)httpBuf.get(),"Content-Length: ");
+      int cLen=q?atoi(q+16):0;
+      *p='\r';                                                    // restore header
+      rxMsgLen=(p-(char *)httpBuf.get())+4+(cLen>0?cLen:0);       // total expected length = header + blank line + content
+      if(rxMsgLen>MAX_HTTP){
+        LOG0("\n*** ERROR:  HTTP message of %d bytes exceeds maximum allowed (%d)\n\n",rxMsgLen,MAX_HTTP);
+        return(-1);
+      }
+    }
+  }
+
+  if(rxMsgLen>=0 && rxBytes>=rxMsgLen)                            // message complete
+    return(rxBytes);
+
+  return(0);                                                      // message still incomplete
 
 } // receiveRequest
+
+//////////////////////////////////////
+
+void HAPClient::resetRequest(){
+
+  rxBytes=0;
+  rxMsgLen=-1;
+  frameLen=-1;
+  frameBytes=0;
+  aadBytes=0;
+  httpBuf.resize(1);
+  frameBuf.resize(1);
+
+} // resetRequest
+
+//////////////////////////////////////
+
+void HAPClient::checkRequestTimeout(){
+
+  if((rxBytes>0 || aadBytes>0 || frameLen>=0) && millis()-rxTime>REQUEST_TIMEOUT){
+    LOG0("\n*** ERROR:  Incomplete HTTP message (%d bytes received before timeout)\n\n",rxBytes);
+    badRequestError();
+    resetRequest();
+  }
+
+} // checkRequestTimeout
 
 /////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////
@@ -1514,6 +1579,7 @@ void HAPClient::saveControllers(){
 
   if(controllerList.empty()){
     nvs_erase_key(homeSpan.hapNVS,"CONTROLLERS");
+    nvs_commit(homeSpan.hapNVS);
     return;
   }
 

@@ -147,11 +147,12 @@ class Pixel : public Blinkable {
     int channel=-1;
     char *pType=NULL;
     rmt_channel_handle_t tx_chan = NULL;
-    rmt_encoder_handle_t encoder;
+    rmt_encoder_handle_t encoder=NULL;
     callbackArgs_t callbackArgs;
 
     rmt_symbol_word_t bit0;        // timing symbol for bit0
     rmt_symbol_word_t bit1;        // timing symbol for bit1
+    int64_t txDoneTime=0;          // time (esp_timer, in usec) at which last transmission completed
     uint32_t resetTime;            // minimum time (in usec) between pulse trains
     uint8_t bytesPerPixel;         // WC=2, RGB=3, RGBW=4, RGBWC=5
     uint8_t symbolsPerPixel;       // will be set to bytesPerPixel * 8
@@ -177,7 +178,7 @@ class Pixel : public Blinkable {
     Pixel *setTiming(float high0, float low0, float high1, float low1, uint32_t lowReset);          // changes default timings for bit pulse - note parameters are in MICROSECONDS
     Pixel *setTemperatures(float wTemp, float cTemp){warmTemp=wTemp;coolTemp=cTemp;return(this);}   // changes default warm-white and cool-white LED temperatures (in Kelvin)
         
-    boolean hasColor(char c){return(strchr(pType,toupper(c))!=NULL || strchr(pType,tolower(c))!=NULL);}   // returns true if pixelType includes c (case-insensitive)
+    boolean hasColor(char c){return(pType!=NULL && (strchr(pType,toupper(c))!=NULL || strchr(pType,tolower(c))!=NULL));}   // returns true if pixelType includes c (case-insensitive)
 
     operator bool(){         // override boolean operator to return true/false if creation succeeded/failed
       return(channel>=0);

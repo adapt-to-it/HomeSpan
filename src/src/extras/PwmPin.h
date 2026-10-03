@@ -92,7 +92,7 @@ class LedPin : public LedC {
     };
 
   private:
-    int fadeState=NOT_FADING;
+    volatile int fadeState=NOT_FADING;
     static bool fadeCallback(const ledc_cb_param_t *param, void *arg);
     static boolean fadeInitialized;
 

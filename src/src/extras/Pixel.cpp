@@ -86,11 +86,6 @@ Pixel::Pixel(int pin, const char *pixelType){
     return;    
   }
 
-  if(rmt_new_tx_channel(&tx_chan_config, &tx_chan)!=ESP_OK){
-    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - no open channels",pin);
-    return;
-  }
-  
   bytesPerPixel=0;
   size_t len=strlen(pixelType);
   boolean invalidMap=false;
@@ -109,16 +104,29 @@ Pixel::Pixel(int pin, const char *pixelType){
   }
 
   symbolsPerPixel=bytesPerPixel*8;                        // pre-compute and store to save time in callback
-  sscanf(pixelType,"%ms",&pType);                         // save pixelType for later use with hasColor()
-  
+
+  if(rmt_new_tx_channel(&tx_chan_config, &tx_chan)!=ESP_OK){
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - no open channels",pin);
+    tx_chan=NULL;
+    return;
+  }
+
   rmt_enable(tx_chan);                                    // enable channel
-  channel=((int *)tx_chan)[0];                            // get channel number
   
   rmt_simple_encoder_config_t simple_config;              // create simple_encoder configuration  
   simple_config.callback = pixelEncodeCallback;           // set callback function to encode data
   simple_config.min_chunk_size=symbolsPerPixel;           // set minimum size to handle a full pixel
   simple_config.arg = &callbackArgs;                      // set callback args  
-  rmt_new_simple_encoder(&simple_config, &encoder);       // create simple_encoder using above configuration
+  if(rmt_new_simple_encoder(&simple_config, &encoder)!=ESP_OK){     // create simple_encoder using above configuration
+    ESP_LOGE(PIXEL_TAG,"Can't create Pixel(%d) - unable to create encoder",pin);
+    rmt_disable(tx_chan);
+    rmt_del_channel(tx_chan);
+    tx_chan=NULL;
+    return;
+  }
+
+  channel=((int *)tx_chan)[0];                            // get channel number (set only after construction can no longer fail)
+  sscanf(pixelType,"%ms",&pType);                         // save pixelType for later use with hasColor()
 
   callbackArgs.pixel=this;                                // set callback arg to point back to this pixel instance   
   setTiming(0.32, 0.88, 0.64, 0.56, 80.0);                // set default timing parameters (suitable for most SK68 and WS28 RGB pixels)
@@ -153,6 +161,10 @@ void Pixel::transmit(const Color *c, size_t nPixels, boolean multiColor){
   if(channel<0 || nPixels==0)
     return;
 
+  int64_t elapsed=esp_timer_get_time()-txDoneTime;
+  if(elapsed<resetTime)                                                       // pause only for the remaining part of the reset time
+    delayMicroseconds(resetTime-elapsed);
+
   rmt_ll_set_group_clock_src(&RMT, channel, RMT_CLK_SRC_DEFAULT, 1, 0, 0);    // ensure use of DEFAULT CLOCK, which is always 80 MHz, without any scaling
 
   callbackArgs.multiColor = multiColor;
@@ -160,7 +172,7 @@ void Pixel::transmit(const Color *c, size_t nPixels, boolean multiColor){
 
   rmt_transmit(tx_chan, encoder, c, nPixels*symbolsPerPixel, &tx_config);     // transmit data (size parameter set to total number of symbols to be written)
   rmt_tx_wait_all_done(tx_chan,-1);                                           // wait until final data is transmitted
-  delayMicroseconds(resetTime);                                               // end-of-marker delay
+  txDoneTime=esp_timer_get_time();                                            // record completion time; reset pause is enforced at start of next transmit
 }
 
 ////////////////////////////////////////////

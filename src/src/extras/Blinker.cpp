@@ -113,16 +113,26 @@ void Blinker::start(int period, float dutyCycle, int nBlinks, int delayTime, boo
   if(!led)
     return;
     
+  stop();                                   // stop previous task before changing any parameters
+
+  if(dutyCycle<0)
+    dutyCycle=0;
+  if(dutyCycle>1)
+    dutyCycle=1;
+
   onTime=dutyCycle*period;
   offTime=period-onTime;
+  if(onTime<1)                              // a zero or negative time would make the task spin without yielding
+    onTime=1;
+  if(offTime<1)
+    offTime=1;
   this->delayTime=delayTime;
   this->nBlinks=nBlinks;
 
-  stop();
-  if(!invert)
-    xTaskCreate( blinkTask, "BlinkTask", 1024, (void *)this, 2, &blinkHandle );
-  else
-    xTaskCreate( blinkTaskInverted, "BlinkTask", 1024, (void *)this, 2, &blinkHandle );
+  if(xTaskCreate(invert?blinkTaskInverted:blinkTask, "BlinkTask", 1024, (void *)this, 2, &blinkHandle)!=pdPASS){
+    blinkHandle=NULL;                       // task not created: leave Blinker stopped (stop() already set status=OFF)
+    return;
+  }
 
   pauseTime=millis();
   isPaused=false;

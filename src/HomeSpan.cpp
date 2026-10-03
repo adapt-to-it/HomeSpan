@@ -260,8 +260,9 @@ void Span::pollTask() {
 
   char cBuf[65]="-";
   if(!serialInputDisabled && Serial.available()){
-    readSerial(cBuf,64);
-    processSerialCommand(cBuf);
+    readSerial(cBuf,64,SERIAL_IDLE_TIMEOUT);
+    if(cBuf[0]!='\0')                                                        // line is empty only if it was discarded after idle timeout
+      processSerialCommand(cBuf);
   }
   
   arduino_event_t event;
@@ -290,8 +291,6 @@ void Span::pollTask() {
       it->client.setNoDelay(true);
     }
 
-    HAPClient::pairStatus=pairState_M1;                                      // reset starting PAIR STATE (which may be needed if Accessory failed in middle of pair-setup)    
-
     LOG2("=======================================\n");
     LOG1("** Client #%d Connected (%lu sec): %s\n",it->clientNumber,millis()/1000,it->client.remoteIP().toString().c_str());
     LOG2("\n");
@@ -306,6 +305,8 @@ void Span::pollTask() {
         strlcpy(homeSpan.lastClientIP,currentClient->client.remoteIP().toString().c_str(),sizeof(homeSpan.lastClientIP));   // store IP Address for web logging
         currentClient->processRequest();                                     // PROCESS HAP REQUEST
         strcpy(homeSpan.lastClientIP,"0.0.0.0");                             // reset stored IP address to show "0.0.0.0" if homeSpan.getClientIP() is used in any other context 
+      } else {
+        currentClient->checkRequestTimeout();                                // close connection if a partially received request has stalled
       }
       if(currentClient->cPair)
         triggerStatus=HS_PAIRED;
@@ -1848,18 +1849,11 @@ boolean Span::updateCharacteristics(char *buf, SpanBufVec &pVec){
 
       for(auto jt=it;jt!=pVec.end();jt++){                                                                  // loop over this object plus any remaining objects to update values and save status for any other characteristics in this service
         
-        if((*jt).characteristic->service==(*it).characteristic->service){                                   // if service of this characteristic matches service that was updated
+        if((*jt).status==StatusCode::TBD && (*jt).characteristic->service==(*it).characteristic->service){  // if object is still TBD (so characteristic is not NULL) and its service matches service that was updated
           (*jt).status=status;                                                                              // save statusCode for this object
           LOG1("Updating aid=%lu iid=%lu",(*jt).characteristic->aid,(*jt).characteristic->iid);
           if(status==StatusCode::OK){                                                                       // if status is okay
             (*jt).characteristic->uvSet((*jt).characteristic->value,(*jt).characteristic->newValue);        // update characteristic value with new value
-            if((*jt).characteristic->nvsKey){                                                               // if storage key found
-              if((*jt).characteristic->format<FORMAT::STRING)
-                nvs_set_u64(charNVS,(*jt).characteristic->nvsKey,(*jt).characteristic->value.UINT64);       // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
-              else
-                nvs_set_str(charNVS,(*jt).characteristic->nvsKey,(*jt).characteristic->value.STRING);       // store data
-              nvs_commit(charNVS);
-            }
             LOG1(" (okay)\n");
           } else {                                                                                          // if status not okay
             (*jt).characteristic->uvSet((*jt).characteristic->newValue,(*jt).characteristic->value);        // replace characteristic new value with original value
@@ -1873,6 +1867,26 @@ boolean Span::updateCharacteristics(char *buf, SpanBufVec &pVec){
   } // loop over all objects
       
   return(true);
+}
+
+///////////////////////////////
+
+void Span::saveCharacteristics(SpanBufVec &pVec){
+
+  boolean saved=false;
+
+  for(auto it=pVec.begin();it!=pVec.end();it++){                                                    // loop over all objects
+    if((*it).status==StatusCode::OK && (*it).val && (*it).characteristic && (*it).characteristic->nvsKey){    // if successfully updated with a new value and storage key found
+      if((*it).characteristic->format<FORMAT::STRING)
+        nvs_set_u64(charNVS,(*it).characteristic->nvsKey,(*it).characteristic->value.UINT64);       // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
+      else
+        nvs_set_str(charNVS,(*it).characteristic->nvsKey,(*it).characteristic->value.STRING);       // store data
+      saved=true;
+    }
+  }
+
+  if(saved)
+    nvs_commit(charNVS);                                                                            // single commit for all values written
 }
 
 ///////////////////////////////
@@ -1938,10 +1952,11 @@ boolean Span::printfAttributes(char **ids, int numIDs, int flags){
   uint32_t aid;
   uint32_t iid;
   
-  SpanCharacteristic *Characteristics[numIDs];
-  StatusCode status[numIDs];
+  TempBuffer<SpanCharacteristic *> Characteristics(numIDs);
+  TempBuffer<StatusCode> status(numIDs);
 
   for(int i=0;i<numIDs;i++){              // PASS 1: loop over all ids requested to check status codes - only errors are if characteristic not found, or not readable
+    aid=iid=0;                            // initialize in case parsing fails
     sscanf(ids[i],"%lu.%lu",&aid,&iid);   // parse aid and iid
     Characteristics[i]=find(aid,iid);     // find matching chararacteristic
     
@@ -1966,6 +1981,7 @@ boolean Span::printfAttributes(char **ids, int numIDs, int flags){
     if(Characteristics[i])                                          // if found
       Characteristics[i]->printfAttributes(flags);                  // get JSON attributes for characteristic (may or may not include status=0 attribute)
     else{                                                           // else create JSON status attribute based on requested aid/iid
+      aid=iid=0;                                                    // initialize in case parsing fails
       sscanf(ids[i],"%lu.%lu",&aid,&iid);                             
       hapOut << "{\"iid\":" << iid << ",\"aid\":" << aid << ",\"status\":" << (int)status[i] << "}";     
     }
@@ -2582,7 +2598,7 @@ void SpanCharacteristic::printfAttributes(int flags){
     for(int i=0;i<7;i++){
       if(perms&(1<<i)){
         hapOut << "\"" << permCodes[i] <<"\"";
-        if(perms>=(1<<(i+1)))
+        if((perms&0x7F)>=(1<<(i+1)))
           hapOut << ",";
       }
     }

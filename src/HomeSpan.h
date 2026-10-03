@@ -275,6 +275,8 @@ class Span{
   friend class Network_HS;
   friend class HAPClient;
   friend void init();
+
+  static const uint32_t SERIAL_IDLE_TIMEOUT=2000;   // max time (in milliseconds) to wait for the next character of a serial command line before discarding it
   
   char *displayName;                            // display name for this device - broadcast as part of Bonjour MDNS
   char *hostNameBase;                           // base of hostName of this device - full host name broadcast by Bonjour MDNS will have 6-byte accessoryID as well as '.local' automatically appended
@@ -386,6 +388,7 @@ class Span{
   char *unEscapeJSON(char *jObj);                                   // converts UTF-8 placeholder bytes back to original special characters
   char *strstr_r(const char *haystack, const char *needle);         // same as standard-C strstr(), but returns pointer to character AFTER end of matched string (or NULL if no match)
   boolean updateCharacteristics(char *buf, SpanBufVec &pVec);       // parses PUT /characteristics JSON request and updates referenced characteristics; returns true on success, false on fail
+  void saveCharacteristics(SpanBufVec &pVec);                       // saves values of successfully updated characteristics in NVS, with a single commit
 
   static boolean invalidUUID(const char *uuid){
     int x=0;

@@ -63,8 +63,9 @@ void StepperControl::move(int nSteps, uint32_t msDelay, endAction_t endAction){
     return;
   }
   
-  upLink_t upLinkData = { .nSteps=nSteps, .msDelay=msDelay, .action=MOVE, .endAction=endAction };
+  upLink_t upLinkData = { .nSteps=nSteps, .msDelay=msDelay, .action=MOVE, .endAction=endAction, .seq=++cmdSeq };
   xQueueOverwrite(upLinkQueue,&upLinkData);
+  xTaskNotifyGive(motorTaskHandle);           // wake motor task immediately
   waitForAck();
 }
 
@@ -76,8 +77,9 @@ void StepperControl::moveTo(int nPosition, uint32_t msDelay, endAction_t endActi
     return;
   }
   
-  upLink_t upLinkData = { .nSteps=nPosition, .msDelay=msDelay, .action=MOVETO, .endAction=endAction };
+  upLink_t upLinkData = { .nSteps=nPosition, .msDelay=msDelay, .action=MOVETO, .endAction=endAction, .seq=++cmdSeq };
   xQueueOverwrite(upLinkQueue,&upLinkData);
+  xTaskNotifyGive(motorTaskHandle);           // wake motor task immediately
   waitForAck();
 }
 
@@ -99,8 +101,9 @@ int StepperControl::position(){
 
 void StepperControl::setPosition(int pos){
   if(!stepsRemaining()){
-    upLink_t upLinkData = { .nSteps=pos, .msDelay=10, .action=SET_POSITION, .endAction=NONE };
+    upLink_t upLinkData = { .nSteps=pos, .msDelay=10, .action=SET_POSITION, .endAction=NONE, .seq=++cmdSeq };
     xQueueOverwrite(upLinkQueue,&upLinkData);
+    xTaskNotifyGive(motorTaskHandle);         // wake motor task immediately
     waitForAck();
   } else {
     ESP_LOGE(STEPPER_TAG,"can't set position while motor is running");
@@ -110,8 +113,7 @@ void StepperControl::setPosition(int pos){
 //////////////////////////
 
 void StepperControl::waitForAck(){
-  downLinkData.ack=false;
-  while(downLinkData.ack==false)
+  while(downLinkData.ackSeq!=cmdSeq)
     xQueueReceive(downLinkQueue,&downLinkData,pdMS_TO_TICKS(10));    // block (rather than spin at 100% CPU) until motor task posts an update
 };
 
@@ -146,7 +148,7 @@ StepperControl *StepperControl::enable(){
 
 void StepperControl::motorTask(void *args){
   StepperControl *motor = (StepperControl *)args;
-  upLink_t upLinkData = { .nSteps=0, .msDelay=10, .action=MOVE, .endAction=NONE };
+  upLink_t upLinkData = { .nSteps=0, .msDelay=10, .action=MOVE, .endAction=NONE, .seq=0 };
   downLink_t downLinkData;
   boolean running=false;
 
@@ -166,17 +168,17 @@ void StepperControl::motorTask(void *args){
         break;
       }
       running=true;
-      downLinkData.ack=true;
+      downLinkData.ackSeq=upLinkData.seq;
     }
 
     uint32_t msDelay=upLinkData.msDelay;
 
     if(running==false){
-      vTaskDelay(msDelay);
+      ulTaskNotifyTake(pdTRUE,pdMS_TO_TICKS(msDelay));    // sleep until next poll interval or until woken by a new command
       continue;
     }
     
-    if(downLinkData.stepsRemaining!=0)
+    if(motor->accelSize>0 && downLinkData.stepsRemaining!=0)
       msDelay+=msDelay * motor->accelSize * (exp(-fabs(upLinkData.nSteps-downLinkData.stepsRemaining)/motor->accelSteps) + exp(-(fabs(downLinkData.stepsRemaining)-1.0)/motor->accelSteps));
       
     ESP_LOGD(STEPPER_TAG,"Position: %d   Steps Remaining: %d   Delay=%d ms",downLinkData.position,downLinkData.stepsRemaining,(int)(msDelay));
@@ -200,8 +202,7 @@ void StepperControl::motorTask(void *args){
     xQueueOverwrite(motor->downLinkQueue,&downLinkData);
     downLinkData.stepsRemaining+=dStep;
     downLinkData.position-=dStep;
-    downLinkData.ack=false;
-    vTaskDelay(msDelay);  
+    vTaskDelay(pdMS_TO_TICKS(msDelay));
   }
 }
 
