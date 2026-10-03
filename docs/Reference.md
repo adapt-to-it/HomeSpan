@@ -306,6 +306,7 @@ The following **optional** `homeSpan` methods enable additional features and pro
     * *logURL* - the URL of the Web Log page for this device.  If unspecified, defaults to "status".  If *logURL* is set to NULL HomeSpan will use the *timeServerURL* and *timeZone* parameters to set the clock, but it will *not* serve any Web Log pages in response to any HTTP requests.  However, Web Log data is still accumulated internally and the resulting HTML can be accessed anytime by calling the `homeSpan.getWebLog()` method (see below)  
   * example: `homeSpan.enableWebLog(50,"pool.ntp.org","UTC-1:00","myLog");` creates a web log at the URL *http<nolink>://HomeSpan-\[DEVICE-ID\].local:\[TCP-PORT\]/myLog* that will display the 50 most-recent log messages produced with the WEBLOG() macro.  Upon start-up (after a WiFi connection has been established) HomeSpan will attempt to set the device clock by calling the server "pool.ntp.org" and adjusting the time to be 1 hour ahead of UTC.
   * when attemping to connect to *timeServerURL*, HomeSpan waits 120 seconds for a response.  This is done in the background and does not block HomeSpan from running as usual while it tries to set the time.  If no response is received after the 120-second timeout period, HomeSpan assumes the server is unreachable and skips the clock-setting procedure.  Use `setTimeServerTimeout()` to re-configure the 120-second timeout period to another value
+  * if the sketch has already started SNTP (for example with its own call to `configTzTime()`), HomeSpan does **not** call `configTzTime()` again, so the time zone and time server set by the sketch are preserved.  HomeSpan writes "Using Time Service already configured by sketch" to the Web Log and then waits for the clock as usual
   * see [Message Logging](Logging.md) for complete details
 
 * `Span& setTimeServerTimeout(uint32_t tSec)`
@@ -455,11 +456,36 @@ The following **optional** `homeSpan` methods are for creating and managing mult
  
 * `TaskHandle_t getAutoPollTask()`
   * returns the task handle for the Auto Poll Task, or NULL if Auto Polling has not been used
-   
+ 
+* `boolean runInPoll(void (*f)(void *), void *arg=NULL)`
+  * queues the function *f*, to be called as `f(arg)` inside HomeSpan's polling task, and returns immediately
+  * returns *true* if the function was queued; returns *false* if *f* is NULL or if the queue (16 entries) is full.  A function queued before polling starts (for example from `setup()`) runs in the first polling cycle
+  * never blocks the calling task
+  * can be called from any task, including HomeSpan's polling task (in which case *f* runs in the next polling cycle).  **Do not** call from an ISR
+  * functions run in the order queued.  Each polling cycle runs at most the functions that were already queued when the cycle started, so a function that queues itself again does not stall polling
+  * *f* runs with the polling mutex held, so inside *f* you can call any HomeSpan method without `homeSpanPAUSE`.  Keep *f* short, because HomeSpan does not poll while it runs
+  * *f* must be a plain function or a lambda without captures; use *arg* to pass data, and make sure *arg* is still valid when *f* runs
+  * example: `homeSpan.runInPoll([](void *arg){ ((SpanCharacteristic *)arg)->setString("Hello"); }, myChar);`
+
+* `Span& setCallbackTask(uint32_t stackSize=4096, uint32_t priority=1, uint32_t core=0)`
+  * creates a task named *hsCallback* that runs the callbacks set with `setStatusCallback()`, `setConnectionCallback()`, `setPairCallback()` and `setControllerCallback()`, so a slow callback no longer stops HomeSpan polling
+  * callbacks run in the order HomeSpan generated them, from a queue of 16 entries.  If the queue is full, HomeSpan drops the new callback and prints a warning
+  * only the first call has effect; later calls do nothing.  Call it before `homeSpan.begin()` or `homeSpan.poll()`/`autoPoll()` to receive every callback through the task
+  * if you do not call this method, these callbacks run in the polling task as before
+  * the callbacks then run outside the polling mutex.  To call HomeSpan methods from a callback, use `homeSpanPAUSE` or `homeSpan.runInPoll()`
+  * other callbacks (such as those set with `setWebLogCallback()` or `setRebootCallback()`) are not affected and always run in the polling task
+
+* `boolean isTimeAcquired()`
+  * returns *true* if HomeSpan has acquired the time from the time server specified in `enableWebLog()`, if `assumeTimeAcquired()` was called, or if the system clock is valid (later than November 2023)
+  * can be called from any task
+  
 * `homeSpanPAUSE`
   * when called, this **MACRO** waits for the current iteration of HomeSpan's polling task to complete and then pauses that process so you can separately call HomeSpan functions from your own thread, typically the main Arduino `loop`
   * allows you to safely read and write values of Characteristics using `setVal` and `getVal` without worrying about race conditions that would have occured if HomeSpan's polling function were running while you were trying to change Characteristics
   * pausing lasts until the end of the scope of the code block in which the `homeSpanPAUSE` macro was called, after which HomeSpan's polling process automatically resumes normal operations
+  * the pause is exclusive: two tasks cannot hold `homeSpanPAUSE` at the same time, and the second task waits until the first releases it
+  * **do not** nest two `homeSpanPAUSE` in the same task (for example in a function called from inside a paused block), because the task would wait for itself and deadlock
+  * for short operations, `homeSpan.runInPoll()` is an alternative that does not make the calling task wait
   * **warning:** this macro should only be used from a thread that is distinct from HomeSpan's polling process.  **DO NOT** use this macro from within any code that is managed by the HomeSpan polling process, which is basically all the `update`, `loop` and other methods you created inside your SpanService structures.  However, you **CAN** call these methods directly from a separate thread, provided that you first call the `homeSpanPAUSE` macro
  
 * `homeSpanRESUME`
@@ -574,6 +600,7 @@ This is a **base class** from which all HomeSpan Characteristics are derived, an
   * a template method that returns the **current** value of a numerical-based Characteristic, after casting into the type *T* specified (e.g. *int*, *double*, etc.).  If template parameter is excluded, value will be cast to *int*.
   * example with template specified: `double temp = Characteristic::CurrentTemperature->getVal<double>();`
   * example with template excluded : `int tilt = Characteristic::CurrentTiltAngle->getVal();`
+  * can be called from any task without `homeSpanPAUSE`.  This applies to `getVal()`, `getNewVal()` and `setVal()` of numerical-based Characteristics only.  The methods for STRING, DATA and TLV8 Characteristics (`setString()`, `setData()`, `setTLV()`, `getString()`, `getData()`, `getTLV()`) are **not** thread-safe: from another task, call them inside a `homeSpanPAUSE` block or with `homeSpan.runInPoll()`
 
 * `type T getNewVal<T>()`
   * a template method that returns the desired **new** value to which a HomeKit Controller has requested the Characteristic be updated.  Same casting rules as for `getVal<>()`
@@ -585,6 +612,7 @@ This is a **base class** from which all HomeSpan Characteristics are derived, an
   * throws a runtime warning to both the Serial Monitor and the Web Log (when enabled) if *value* is outside of the min/max range for the Characteristic, where min/max is either the HAP default, or any new min/max range set via a prior call to `setRange()`
   * note that *value* is **not** restricted to being an increment of the step size; for example it is perfectly valid to call `setVal(43.5)` after calling `setRange(0,100,5)` on a floating-based Characteristic even though 43.5 does does not align with the step size specified.  The Home App will properly retain the value as 43.5, though it will round to the nearest step size increment (in this case 45) when used in a slider graphic (such as setting the temperature of a thermostat)
   * throws a runtime warning if called from within the `update()` routine of a **SpanService** *and* `isUpdated()` is *true* for the Characteristic (i.e. it is being updated at the same time via the Home App), *unless* you are changing the value of a Characteristic in response to a *write-response* request from HomeKit (typically used only for certain TLV-based Characteristics)
+  * can be called from any task without `homeSpanPAUSE` (numerical-based Characteristics only; see the note under `getVal<T>()`)
   * note this method can be used to update the value of a Characteristic even if the Characteristic is not permissioned for event notifications (EV), in which case the value stored by HomeSpan will be updated but the Home App will *not* be notified of the change
 
 * `SpanCharacteristic *setRange(min, max, step)`

@@ -28,6 +28,8 @@
 #include "Utils.h"
 #include "HomeSpan.h"
 
+#include <mutex>
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 //  Contains various generic utility functions and classes:
@@ -35,11 +37,54 @@
 //  Utils::readSerial       - reads all characters from Serial port and saves only up to max specified (with optional idle timeout)
 //  Utils::mask             - masks a string with asterisks (good for displaying passwords)
 //  Utils::resetReason      - returns literal string description of esp_reset_reason()
+//  Utils::logLock/Unlock   - take/release the recursive mutex that makes each LOG0/LOG1/LOG2 call atomic
+//  Utils::logPrintf        - locked Serial.printf used by LOG0/LOG1/LOG2 (single-argument form is the template Utils::logPrint in Utils.h)
 //
 //  class PushButton        - tracks Single, Double, and Long Presses of a pushbutton that connects a specified pin to ground
 //  class hsWatchdogTimer   - a generic watchdog timer that reboots the ESP32 device if not reset periodically
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static std::recursive_mutex logMutex;
+
+//////////////////////////////////////
+
+void Utils::logLock(){
+  logMutex.lock();
+}
+
+//////////////////////////////////////
+
+void Utils::logUnlock(){
+  logMutex.unlock();
+}
+
+//////////////////////////////////////
+
+void Utils::logPrintf(const char *format, ...){
+  va_list args;
+  va_start(args,format);
+  logMutex.lock();
+  Serial.vprintf(format,args);
+  logMutex.unlock();
+  va_end(args);
+}
+
+//////////////////////////////////////
+
+void Utils::logPrint(const char *s){
+  logMutex.lock();
+  Serial.print(s);
+  logMutex.unlock();
+}
+
+//////////////////////////////////////
+
+void Utils::logPrint(char *s){
+  logPrint((const char *)s);
+}
+
+//////////////////////////////////////
 
 char *Utils::readSerial(char *c, int max, uint32_t idleTimeout){
 

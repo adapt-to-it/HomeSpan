@@ -44,6 +44,8 @@
 
 #include <Arduino.h>
 #include <driver/ledc.h>
+#include <soc/soc_caps.h>
+#include <mutex>
 #include "Blinker.h"
 
 [[maybe_unused]] static const char* PWM_TAG = "PwmPin";
@@ -57,17 +59,24 @@ class LedC {
   protected:
     static ledc_channel_config_t *channelList[LEDC_CHANNEL_MAX][LEDC_SPEED_MODE_MAX];
     static ledc_timer_config_t *timerList[LEDC_TIMER_MAX][LEDC_SPEED_MODE_MAX];
+    static boolean channelReserved[LEDC_CHANNEL_MAX][LEDC_SPEED_MODE_MAX];   // channels used outside of this library: never allocated
+    static boolean timerReserved[LEDC_TIMER_MAX][LEDC_SPEED_MODE_MAX];       // timers used outside of this library: never allocated
     
     ledc_channel_config_t *channel=NULL;
     ledc_timer_config_t *timer;
     boolean configured=false;                                          // set to true once channel has been fully configured
     
-    LedC(uint8_t pin, uint16_t freq, boolean invert=false);
+    LedC(uint8_t pin, uint32_t freq, boolean invert=false, uint8_t resolution=0);
     void setDuty(uint32_t duty);                                       // sets duty (fully configures channel on first call, then just updates duty)
     uint32_t maxDuty(){return((1<<timer->duty_resolution)-1);}        // maximum duty value based on timer resolution
 
   public:
     int getPin(){return(channel?channel->gpio_num:-1);}               // returns the pin number
+    uint8_t getResolution(){return(channel?timer->duty_resolution:0);}   // returns the timer resolution in bits (0 if not created)
+    uint32_t getFreq(){return(channel?timer->freq_hz:0);}             // returns the timer frequency in Hz (0 if not created)
+
+    static boolean reserveChannel(ledc_mode_t mode, ledc_channel_t channel);   // marks a channel as used elsewhere, so it is never allocated; call before creating LedPin/ServoPin objects
+    static boolean reserveTimer(ledc_mode_t mode, ledc_timer_t timer);         // marks a timer as used elsewhere, so it is never allocated; call before creating LedPin/ServoPin objects
 
     operator bool(){         // override boolean operator to return true/false if creation succeeded/failed
       return(channel);    
@@ -93,14 +102,41 @@ class LedPin : public LedC {
 
   private:
     volatile int fadeState=NOT_FADING;
+    std::recursive_mutex mux;                                          // serializes calls from different tasks on the same object (never taken in ISR context)
+    portMUX_TYPE pendingMux=portMUX_INITIALIZER_UNLOCKED;              // protects the pending request below (shared between tasks and ISR)
+    boolean pendingValid=false;                                        // true if a fade request is waiting for the current fade to end
+    boolean pendingQueued=false;                                       // true if the ISR has already handed the pending request to the ledFade task
+    float pendingLevel=0;
+    uint32_t pendingTime=0;
+    int pendingType=ABSOLUTE;
+    void (*endCallback)(LedPin *, void *)=NULL;                        // end-of-fade function and argument: accessed only under pendingMux
+    void *endArg=NULL;
+    volatile uint32_t fadeStartMs=0;                                   // millis() when the last fade was started
+    volatile uint32_t fadeDurationMs=0;                                // duration of the last fade, in milliseconds
+    // Fade end is considered missed only after 2x the requested time (the ledc.h notes of ledc_set_fade_with_time() say the actual duration can be up to 2x longer
+    // than requested), plus one PWM cycle, plus a 500 ms margin. 64-bit math avoids overflow with very large fade times. Read-only.
+    boolean fadeOverdue(){return(fadeState==FADING && (uint64_t)(uint32_t)(millis()-fadeStartMs)>2*(uint64_t)fadeDurationMs+(1000+(uint64_t)getFreq()-1)/getFreq()+500);}
+
     static bool fadeCallback(const ledc_cb_param_t *param, void *arg);
     static boolean fadeInitialized;
 
+    int startFade(float level, uint32_t fadeTime, int fadeType);       // starts the hardware fade now (mux must be held, no fade may be in progress)
+    boolean cancelPending();                                           // discards the pending request; returns true if it had already been handed to the ledFade task
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+    static QueueHandle_t fadeQueue;
+    static boolean startFadeTask();
+    static void fadeTask(void *arg);
+    void startPending();
+#endif
+
   public:
-    LedPin(uint8_t pin, float level=0, uint16_t freq=DEFAULT_PWM_FREQ, boolean invert=false);   // assigns LED pin
+    LedPin(uint8_t pin, float level=0, uint32_t freq=DEFAULT_PWM_FREQ, boolean invert=false, uint8_t resolution=0);   // assigns LED pin; resolution in bits (0=maximum possible for freq)
     void set(float level);                                                                      // sets the PWM duty to level (0-100)
     int fade(float level, uint32_t fadeTime, int fadeType=ABSOLUTE);                            // sets the PWM duty to level (0-100) within fadeTime in milliseconds, returns success (0) or fail (1)
     int fadeStatus();                                                                           // returns fading state
+    boolean isFading();                                                                         // returns true if fading or a fade is pending; no side effects
+    float getLevel();                                                                           // returns the current level (0-100) read from the hardware
+    LedPin *setFadeCallback(void (*f)(LedPin *, void *), void *arg=NULL);                      // f is called when a fade ends with no pending request; runs in ISR context: keep it short, no blocking calls, no logging
     
     static void HSVtoRGB(float h, float s, float v, float *r, float *g, float *b );       // converts Hue/Saturation/Brightness to R/G/B
 };

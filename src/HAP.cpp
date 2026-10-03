@@ -538,8 +538,7 @@ int HAPClient::postPairSetupURL(uint8_t *content, size_t len){
 
       homeSpan.setStatus(HS_PAIRED);
             
-      if(homeSpan.pairCallback)                             // if set, invoke user-defined Pairing Callback to indicate device has been paired
-        homeSpan.pairCallback(true);
+      homeSpan.dispatchCallback(Span::CB_PAIR,true);        // if set, invoke user-defined Pairing Callback to indicate device has been paired
       
       return(1);        
     }       
@@ -1217,10 +1216,15 @@ void HAPClient::getStatusURL(HAPClient *hapClient, void (*callBack)(const char *
 
 void HAPClient::checkNotifications(){
 
-  if(!homeSpan.Notifications.empty()){       // if there are Notifications to process    
-    eventNotify(homeSpan.Notifications);     // transmit EVENT Notifications
-    homeSpan.Notifications.clear();          // clear Notifications vector
+  SpanBufVec pending;
+
+  {
+    std::lock_guard<std::mutex> lock(homeSpan.notifyMutex);
+    pending.swap(homeSpan.Notifications);    // take all pending Notifications and leave vector empty
   }
+
+  if(!pending.empty())                       // if there are Notifications to process
+    eventNotify(pending);                    // transmit EVENT Notifications (without holding notifyMutex)
 }
 
 //////////////////////////////////////
@@ -1536,8 +1540,7 @@ void HAPClient::removeController(uint8_t *id){
     controllerList.clear();                                      // remove all remaining Controllers
     mdns_service_txt_item_set("_hap","_tcp","sf","1");           // set Status Flag = 1 (Table 6-8)
     homeSpan.resetStatus();                                      // reset hsStatus and StatusLED
-    if(homeSpan.pairCallback)                                    // if set, invoke user-defined Pairing Callback to indicate device has been un-paired
-      homeSpan.pairCallback(false);    
+    homeSpan.dispatchCallback(Span::CB_PAIR,false);              // if set, invoke user-defined Pairing Callback to indicate device has been un-paired
   }
 
   saveControllers();
@@ -1574,8 +1577,7 @@ void HAPClient::printControllers(){
 
 void HAPClient::saveControllers(){
 
-  if(homeSpan.controllerCallback)
-    homeSpan.controllerCallback();
+  homeSpan.dispatchCallback(Span::CB_CONTROLLER,0);
 
   if(controllerList.empty()){
     nvs_erase_key(homeSpan.hapNVS,"CONTROLLERS");

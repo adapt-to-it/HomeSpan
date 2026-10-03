@@ -114,6 +114,7 @@ void Span::init(){
   delay(1);                                               // required to yield (prevents crashing)
   
   networkEventQueue=xQueueCreate(10,sizeof(arduino_event_t));             // queue to transmit network events
+  runQueue=xQueueCreate(RUN_QUEUE_SIZE,sizeof(RunItem));                  // queue of functions to run in poll task (see runInPoll)
   
   Network.onEvent([](arduino_event_t *event){                             // only queue events handled in networkCallback() so that unrelated events cannot fill the queue
     switch(event->event_id){                                              // and cause critical events (e.g. GOT_IP or DISCONNECTED) to be dropped while poll() is busy
@@ -241,6 +242,10 @@ void Span::pollTask() {
     isInitialized=true;    
     
   } // isInitialized
+
+  RunItem runItem;
+  for(UBaseType_t n=runQueue?uxQueueMessagesWaiting(runQueue):0; n>0 && xQueueReceive(runQueue, &runItem, (TickType_t)0); n--)       // run only items present at start, so a function that re-queues itself cannot stall poll
+    runItem.f(runItem.arg);
 
   if(!ethernetEnabled && strlen(network.wifiData.ssid) && !(connected%2) && (int32_t)(millis()-alarmConnect)>0){                  // rollover-safe comparison
     if(verboseWifiReconnect)
@@ -483,8 +488,7 @@ void Span::networkCallback(const arduino_event_t &event){
         connected++;
         if(connected==1)
           configureNetwork();
-        if(connectionCallback)
-          connectionCallback((connected+1)/2);
+        dispatchCallback(CB_CONNECTION,(connected+1)/2);
         if(rescanInitialTime>0){
           rescanAlarm=millis()+rescanInitialTime;
           rescanStatus=RESCAN_PENDING;
@@ -530,8 +534,7 @@ void Span::networkCallback(const arduino_event_t &event){
         connected++;
         if(connected==1)
           configureNetwork();
-        if(connectionCallback)
-          connectionCallback((connected+1)/2);
+        dispatchCallback(CB_CONNECTION,(connected+1)/2);
         resetStatus();     
       }
     break;
@@ -947,8 +950,7 @@ void Span::processSerialCommand(const char *c){
       LOG0("\nDEVICE NOT YET PAIRED -- PLEASE PAIR WITH HOMEKIT APP\n\n");
       mdns_service_txt_item_set("_hap","_tcp","sf","1");                        // set Status Flag = 1 (Table 6-8)
 
-      if(homeSpan.pairCallback)
-        homeSpan.pairCallback(false);
+      dispatchCallback(CB_PAIR,false);
 
       resetStatus();      
     }
@@ -1454,6 +1456,109 @@ void Span::resetStatusDuration(){
 
 ///////////////////////////////
 
+boolean Span::runInPoll(void (*f)(void *), void *arg){
+
+  if(!f || !runQueue)
+    return(false);
+
+  RunItem item={f,arg};
+  return(xQueueSend(runQueue, &item, (TickType_t)0)==pdTRUE);       // never blocks; returns false if queue is full
+}
+
+///////////////////////////////
+
+Span& Span::setCallbackTask(uint32_t stackSize, uint32_t priority, uint32_t core){
+
+  static std::mutex createMutex;                      // makes concurrent first calls safe
+  std::lock_guard<std::mutex> lock(createMutex);
+
+  if(callbackQueue)                                   // task already created
+    return(*this);
+
+  callbackQueue=xQueueCreate(CALLBACK_QUEUE_SIZE,sizeof(CallbackItem));
+  if(!callbackQueue)
+    return(*this);
+
+  xTaskCreateUniversal([](void *parms){
+    CallbackItem item;
+    for(;;){
+      if(xQueueReceive(homeSpan.callbackQueue, &item, portMAX_DELAY))
+        homeSpan.callUserCallback(item);
+    }
+  }, "hsCallback", stackSize, NULL, priority, NULL, core);
+
+  return(*this);
+}
+
+///////////////////////////////
+
+void Span::dispatchCallback(CallbackType type, int32_t arg){
+
+  CallbackItem item={type,arg};
+
+  boolean isSet=false;
+  switch(type){
+    case CB_STATUS: isSet=(statusCallback!=NULL); break;
+    case CB_CONNECTION: isSet=(connectionCallback!=NULL); break;
+    case CB_PAIR: isSet=(pairCallback!=NULL); break;
+    case CB_CONTROLLER: isSet=(controllerCallback!=NULL); break;
+  }
+
+  if(!isSet)
+    return;
+
+  if(!callbackQueue){                                 // callback task not active: call directly
+    callUserCallback(item);
+    return;
+  }
+
+  if(xQueueSend(callbackQueue, &item, (TickType_t)0)!=pdTRUE)
+    LOG0("\n*** WARNING: Callback queue is full - callback dropped\n\n");
+}
+
+///////////////////////////////
+
+void Span::callUserCallback(const CallbackItem &item){
+
+  switch(item.type){
+    case CB_STATUS:
+      if(statusCallback)
+        statusCallback((HS_STATUS)item.arg);
+    break;
+    case CB_CONNECTION:
+      if(connectionCallback)
+        connectionCallback(item.arg);
+    break;
+    case CB_PAIR:
+      if(pairCallback)
+        pairCallback(item.arg!=0);
+    break;
+    case CB_CONTROLLER:
+      if(controllerCallback)
+        controllerCallback();
+    break;
+  }
+}
+
+///////////////////////////////
+
+void Span::addNotification(SpanCharacteristic *c){
+
+  SpanBuf sb;                             // create SpanBuf object
+  sb.characteristic=c;                    // set characteristic
+  sb.status=StatusCode::OK;               // set status
+  sb.val=const_cast<char *>("");          // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
+
+  std::lock_guard<std::mutex> lock(notifyMutex);
+  for(auto it=Notifications.begin();it!=Notifications.end();it++){      // notification already pending for this Characteristic: it will report the current value
+    if((*it).characteristic==c)
+      return;
+  }
+  Notifications.push_back(sb);            // store SpanBuf in Notifications vector
+}
+
+///////////////////////////////
+
 void Span::setStatus(HS_STATUS hst){
 
   std::unique_lock writeLock(hsStatusMux);          // wait for mux to be unlocked and then lock *exclusively* so write can proceed uninterrupted
@@ -1491,8 +1596,7 @@ void Span::setStatus(HS_STATUS hst){
 
   writeLock.unlock();                       // unlock before calling optional callback
 
-  if(statusCallback)                        // call optional user callback if defined
-    statusCallback(hsStatus);
+  dispatchCallback(CB_STATUS,hst);     // call optional user callback if defined
 }
 
 ///////////////////////////////
@@ -1878,7 +1982,7 @@ void Span::saveCharacteristics(SpanBufVec &pVec){
   for(auto it=pVec.begin();it!=pVec.end();it++){                                                    // loop over all objects
     if((*it).status==StatusCode::OK && (*it).val && (*it).characteristic && (*it).characteristic->nvsKey){    // if successfully updated with a new value and storage key found
       if((*it).characteristic->format<FORMAT::STRING)
-        nvs_set_u64(charNVS,(*it).characteristic->nvsKey,(*it).characteristic->value.UINT64);       // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
+        nvs_set_u64(charNVS,(*it).characteristic->nvsKey,(*it).characteristic->uvCopy((*it).characteristic->value).UINT64);       // store data as uint64_t regardless of actual type (it will be read correctly when access through uvGet())         
       else
         nvs_set_str(charNVS,(*it).characteristic->nvsKey,(*it).characteristic->value.STRING);       // store data
       saved=true;
@@ -2295,28 +2399,29 @@ SpanCharacteristic::~SpanCharacteristic(){
 ///////////////////////////////
 
 String SpanCharacteristic::uvPrint(UVal &u){
+  UVal v=(format<FORMAT::STRING)?uvCopy(u):u;      // numeric values are copied under valMux; STRING-based values are not protected
   char c[64];
   switch(format){
     case FORMAT::BOOL:
-      return(String(u.BOOL));      
+      return(String(v.BOOL));      
     case FORMAT::INT:
-      return(String(u.INT));
+      return(String(v.INT));
     case FORMAT::UINT8:
-      return(String(u.UINT8));        
+      return(String(v.UINT8));        
     case FORMAT::UINT16:
-      return(String(u.UINT16));        
+      return(String(v.UINT16));        
     case FORMAT::UINT32:
-      return(String(u.UINT32));        
+      return(String(v.UINT32));        
     case FORMAT::UINT64:
-      sprintf(c,"%llu",u.UINT64);
+      sprintf(c,"%llu",v.UINT64);
       return(String(c));        
     case FORMAT::FLOAT:
-      sprintf(c,"%g",u.FLOAT);
+      sprintf(c,"%g",v.FLOAT);
       return(String(c));        
     case FORMAT::STRING:
     case FORMAT::DATA:
     case FORMAT::TLV_ENC:
-      return(String("\"") + String(u.STRING) + String("\""));        
+      return(String("\"") + String(v.STRING) + String("\""));        
   } // switch
   return(String());       // included to prevent compiler warnings
 }
@@ -2324,34 +2429,35 @@ String SpanCharacteristic::uvPrint(UVal &u){
 ///////////////////////////////
 
 void SpanCharacteristic::uvStream(UVal &u){
+  UVal v=(format<FORMAT::STRING)?uvCopy(u):u;      // numeric values are copied under valMux; STRING-based values are not protected
   char c[32];
   switch(format){
     case FORMAT::BOOL:
-      hapOut << (u.BOOL?'1':'0');
+      hapOut << (v.BOOL?'1':'0');
       return;
     case FORMAT::INT:
-      hapOut << u.INT;
+      hapOut << v.INT;
       return;
     case FORMAT::UINT8:
-      hapOut << (uint32_t)u.UINT8;
+      hapOut << (uint32_t)v.UINT8;
       return;
     case FORMAT::UINT16:
-      hapOut << u.UINT16;
+      hapOut << v.UINT16;
       return;
     case FORMAT::UINT32:
-      hapOut << u.UINT32;
+      hapOut << v.UINT32;
       return;
     case FORMAT::UINT64:
-      hapOut << u.UINT64;
+      hapOut << v.UINT64;
       return;
     case FORMAT::FLOAT:
-      snprintf(c,sizeof(c),"%g",u.FLOAT);
+      snprintf(c,sizeof(c),"%g",v.FLOAT);
       hapOut << c;
       return;
     case FORMAT::STRING:
     case FORMAT::DATA:
     case FORMAT::TLV_ENC:
-      hapOut << '"' << u.STRING << '"';
+      hapOut << '"' << v.STRING << '"';
       return;
   } // switch
 }
@@ -2359,10 +2465,13 @@ void SpanCharacteristic::uvStream(UVal &u){
 ///////////////////////////////
 
 void SpanCharacteristic::uvSet(UVal &dest, UVal &src){
-  if(format>=FORMAT::STRING)
+  if(format>=FORMAT::STRING){
     uvSet(dest,(const char *)src.STRING);
-  else
+  } else {
+    portENTER_CRITICAL(&valMux);          // only copy bytes inside critical section
     dest=src;
+    portEXIT_CRITICAL(&valMux);
+  }
 }
 
 ///////////////////////////////
@@ -2523,11 +2632,7 @@ void SpanCharacteristic::setValFinish(boolean notify){
 
   if(notify){
     if((perms&EV) && (updateFlag!=2)){        // only broadcast notification if EV permission is set AND update is NOT being done in context of write-response    
-      SpanBuf sb;                             // create SpanBuf object
-      sb.characteristic=this;                 // set characteristic          
-      sb.status=StatusCode::OK;               // set status
-      sb.val=const_cast<char *>("");             // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
-      homeSpan.Notifications.push_back(sb);   // store SpanBuf in Notifications vector
+      homeSpan.addNotification(this);         // store SpanBuf in Notifications vector (protected by mutex)
     }
 
     if(nvsKey){
@@ -2649,64 +2754,67 @@ StatusCode SpanCharacteristic::loadUpdate(char *val, char *ev, boolean wr){
   if(!(perms&PW))         // cannot write to read only characteristic
     return(StatusCode::ReadOnly);
 
+  UVal tv;                // parse into local copy and store under valMux, so newValue is never half-written
+  tv.UINT64=0;
+
   switch(format){
     
     case BOOL:
       if(!strcmp(val,"0") || !strcmp(val,"false"))
-        newValue.BOOL=false;
+        tv.BOOL=false;
       else if(!strcmp(val,"1") || !strcmp(val,"true"))
-        newValue.BOOL=true;
+        tv.BOOL=true;
       else
         return(StatusCode::InvalidValue);
       break;
 
     case INT:
       if(!strcmp(val,"false"))
-        newValue.INT=0;
+        tv.INT=0;
       else if(!strcmp(val,"true"))
-        newValue.INT=1;
-      else if(!sscanf(val,"%ld",&newValue.INT))
+        tv.INT=1;
+      else if(!sscanf(val,"%ld",&tv.INT))
         return(StatusCode::InvalidValue);
       break;
 
     case UINT8:
       if(!strcmp(val,"false"))
-        newValue.UINT8=0;
+        tv.UINT8=0;
       else if(!strcmp(val,"true"))
-        newValue.UINT8=1;
-      else if(!sscanf(val,"%hhu",&newValue.UINT8))
+        tv.UINT8=1;
+      else if(!sscanf(val,"%hhu",&tv.UINT8))
         return(StatusCode::InvalidValue);
       break;
             
     case UINT16:
       if(!strcmp(val,"false"))
-        newValue.UINT16=0;
+        tv.UINT16=0;
       else if(!strcmp(val,"true"))
-        newValue.UINT16=1;
-      else if(!sscanf(val,"%hu",&newValue.UINT16))
+        tv.UINT16=1;
+      else if(!sscanf(val,"%hu",&tv.UINT16))
         return(StatusCode::InvalidValue);
       break;
       
     case UINT32:
       if(!strcmp(val,"false"))
-        newValue.UINT32=0;
+        tv.UINT32=0;
       else if(!strcmp(val,"true"))
-        newValue.UINT32=1;
-      else if(!sscanf(val,"%lu",&newValue.UINT32))
+        tv.UINT32=1;
+      else if(!sscanf(val,"%lu",&tv.UINT32))
         return(StatusCode::InvalidValue);
       break;
       
     case UINT64:
       if(!strcmp(val,"false"))
-        newValue.UINT64=0;
+        tv.UINT64=0;
       else if(!strcmp(val,"true"))
-        newValue.UINT64=1;
-      else if(!sscanf(val,"%llu",&newValue.UINT64))
+        tv.UINT64=1;
+      else if(!sscanf(val,"%llu",&tv.UINT64))
         return(StatusCode::InvalidValue);
       break;
 
     case FLOAT:
-      if(!sscanf(val,"%lg",&newValue.FLOAT))
+      if(!sscanf(val,"%lg",&tv.FLOAT))
         return(StatusCode::InvalidValue);
       break;
 
@@ -2723,6 +2831,9 @@ StatusCode SpanCharacteristic::loadUpdate(char *val, char *ev, boolean wr){
     break;
 
   } // switch
+
+  if(format<FORMAT::STRING)
+    uvStore(newValue,tv);
 
   updateFlag=1+wr;                // set flag to 1 if successful update or 2 if successful AND write-response flag is set
   updateTime=homeSpan.snapTime;
@@ -2949,8 +3060,13 @@ void SpanWebLog::init(uint16_t maxEntries, const char *serv, const char *tz, con
 void SpanWebLog::initTime(void *args){
   SpanWebLog *wLog = (SpanWebLog *)args;
   
-  WEBLOG("Acquiring Time from %s (%s)",wLog->timeServer,wLog->timeZone,wLog->waitTime/1000);
-  configTzTime(wLog->timeZone,wLog->timeServer);
+  if(esp_sntp_enabled() && !wLog->sntpByHomeSpan){        // SNTP already running and HomeSpan did not start it
+    WEBLOG("Using Time Service already configured by sketch");
+  } else {
+    WEBLOG("Acquiring Time from %s (%s)",wLog->timeServer,wLog->timeZone,wLog->waitTime/1000);
+    configTzTime(wLog->timeZone,wLog->timeServer);
+    wLog->sntpByHomeSpan=true;
+  }
   struct tm timeinfo;
   if(getLocalTime(&timeinfo,wLog->waitTime)){
     strftime(wLog->bootTime,sizeof(wLog->bootTime),"%c",&timeinfo);
@@ -3123,6 +3239,8 @@ int SpanOTA::otaPercent;
 boolean SpanOTA::safeLoad;
 boolean SpanOTA::enabled=false;
 boolean SpanOTA::auth;
+
+portMUX_TYPE SpanCharacteristic::valMux=portMUX_INITIALIZER_UNLOCKED;
 
 ///////////////////////////////
 //        SpanPoint          //

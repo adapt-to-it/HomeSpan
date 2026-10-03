@@ -2,14 +2,15 @@
 
 The ESP32 has up to 16 PWM channels that can be used to drive a variety of devices.  HomeSpan includes an integrated PWM library with dedicated classes designed for controlling **Dimmable LEDs** as well as **Servo Motors**.
 
-## *LedPin(uint8_t pin [,float level [,uint16_t frequency [,boolean invert]]])*
+## *LedPin(uint8_t pin [,float level [,uint32_t frequency [,boolean invert [,uint8_t resolution]]]])*
 
 Creating an instance of this **class** configures the specified *pin* to output a PWM signal suitable for a controlling dimmable LED.  Arguments, along with their defaults if left unspecified, are as follows:
 
   * *pin* - the pin on which the PWM control signal will be output
   * *level* - sets the initial %duty-cycle of the PWM from from 0 (LED completely off) to 100 (LED fully on).  Default=0 (LED initially off)
-  * *frequency* - sets the PWM frequency, in Hz, from 1-65535 (ESP32 only) or 5-65535 (ESP32-S2 and ESP32-C3).  Defaults to 5000 Hz if unspecified, or if set to 0
-  * *boolean* - if true, the output of the PWM signal will be inverted.  Default=false
+  * *frequency* - sets the PWM frequency, in Hz, as a 32-bit value.  The usable range depends on the chip and on the resolution (the hardware divides an 80 MHz clock).  Defaults to 5000 Hz if unspecified, or if set to 0
+  * *invert* - if true, the output of the PWM signal will be inverted.  Default=false
+  * *resolution* - sets the duty-cycle resolution of the timer, in bits.  Default=0, which selects the maximum resolution possible for the frequency.  If the resolution requested is higher than the maximum possible for the frequency, the maximum is used and a warning message is output.  A Timer is shared with another LedPin or ServoPin only if the frequency is the same and either *resolution* is 0 or it equals the resolution of that Timer
  
  The following methods are supported:
 
@@ -25,8 +26,11 @@ Creating an instance of this **class** configures the specified *pin* to output 
     * `fade(20, 1000, LedPin::ABSOLUTE)` sets the level to 20 over the course of 1 second, whereas
     * `fade(20, 1000, LedPin::PROPORTIONAL)` sets the level to 20 over the course of 100 milliseconds (since the level only needs to change by 10 out of 100 units)
   * this is a **NON-BLOCKING** method and will return immediately.  Fading occurs in the background controlled by the ESP32 hardware
-  * note: once fading begins it CANNOT be stopped or changed until completed (this is a limitation of the ESP32 hardware)
-  * this method returns 0 if the fading has successfully started, or 1 if fading is already in progress and cannot yet be changed (new requests for fading while fading is already in progress for a specific LedPin are simply ignored)
+  * if a fade is already in progress, *fade()* sets a new destination without blocking the caller.  The behavior depends on the chip:
+    * chips that support stopping a fade (ESP32-S2, S3, C3, C5, C6): the fade in progress is stopped and the new fade starts at once from the current level
+    * ESP32 (original): the hardware cannot change a fade in progress.  The request is stored as *pending* and starts automatically as soon as the current fade ends, from a shared background task named *ledFade* (created on the first pending request).  A newer pending request replaces an older one, so only the last request is executed.  Until the last fade ends, `fadeStatus()` and `isFading()` report fading
+  * this method returns 0 if the fading has started or the request has been accepted, or 1 if the fade could not be started
+  * calling `set()` while a fade is in progress ends the fade and discards any pending request
   * use the *fadeStatus* method (below) to determine the current fading status of any given LedPin
 
 * `int fadeStatus()`
@@ -34,14 +38,38 @@ Creating an instance of this **class** configures the specified *pin* to output 
   * returns the fading status of an LedPin.  Return values are as follows:
   
     * **LedPin::NOT_FADING** - the LedPin is not currently fading
-    * **LedPin::FADING** - fading on LedPin is currently in progress and cannot be changed/stopped
+    * **LedPin::FADING** - fading on LedPin is currently in progress (or a new fade is pending).  If the end of a fade is not detected within twice the requested fade time plus a margin, the fade is considered finished, so a stuck state cannot persist
     * **LedPin::COMPLETED** - fading has just completed  
       * once this value is returned, subsequent calls to `fadeStatus()` will return **LedPin::NOT_FADING** (unless you called `fade()` again)
       * by checking for `fadeStatus()==LedPin::COMPLETED` in a `loop()` method, you can thus trigger a new action (if desired) once fading is completed
   
+* `boolean isFading()`
+
+  * returns true if a fade is in progress or a fade request is pending, false otherwise.  A fade whose end is not detected within twice the requested fade time plus one PWM cycle plus 500 ms is considered finished (protection against a stuck state)
+  * this method only reads the state (unlike `fadeStatus()`, it never changes it) and can be called from any task
+
+* `float getLevel()`
+
+  * returns the current level, from 0 to 100, read from the PWM hardware (returns 0 if the LedPin was not successfully initialized)
+
+* `LedPin *setFadeCallback(void (*f)(LedPin *, void *), void *arg=NULL)`
+
+  * registers the function *f*, which is called with the LedPin and *arg* when a fade ends and no pending request follows it.  Returns the LedPin itself, so calls can be chained
+  * **the function runs in interrupt (ISR) context**: keep it short, do not call blocking functions, and do not log.  Functions that run in ISR context should be placed in IRAM with `IRAM_ATTR`
+
 * `int getPin()`
 
   * returns the pin number (or -1 if LedPin was not successfully initialized)
+
+* `uint8_t getResolution()`
+
+  * returns the resolution of the Timer, in bits (0 if the LedPin was not successfully initialized)
+
+* `uint32_t getFreq()`
+
+  * returns the frequency of the Timer, in Hz (0 if the LedPin was not successfully initialized)
+
+The methods `set()`, `fade()`, `fadeStatus()` and `getLevel()` can be called from different tasks on the same LedPin.  Each LedPin has its own recursive mutex, so concurrent calls on the same object are serialized.  No mutex is taken in ISR context.
   
 LedPin also includes a static class function that converts Hue/Saturation/Brightness values (typically used by HomeKit) to Red/Green/Blue values (typically used to control multi-color LEDS).
 
@@ -89,7 +117,42 @@ The following PWM resources are available:
 * ESP32-C3: 6 Channels / 4 Timers
 * ESP32-S3: 8 Channels / 4 Timers
 
-HomeSpan *automatically* allocates Channels and Timers to LedPin and ServoPin objects as they are instantiated. Every pin assigned consumes a single Channel;  every *unique* frequency specified among all channels (within the same set, for the ESP32) consumes a single Timer.  HomeSpan will conserve resources by re-using the same Timer for all Channels operating at the same frequency.  *HomeSpan also automatically configures each Timer to support the maximum duty-resolution possible for the frequency specified.*
+HomeSpan *automatically* allocates Channels and Timers to LedPin and ServoPin objects as they are instantiated. Every pin assigned consumes a single Channel;  every *unique* frequency specified among all channels (within the same set, for the ESP32) consumes a single Timer.  HomeSpan will conserve resources by re-using the same Timer for all Channels operating at the same frequency.  *Unless you specify the optional `resolution` argument of the LedPin constructor, HomeSpan automatically configures each Timer to support the maximum duty-resolution possible for the frequency specified.*  A Timer is re-used only if the frequency is the same and the requested resolution is either unspecified (0) or equal to that of the Timer.
+
+#### Sharing PWM Resources with Other Code
+
+If your sketch also uses the LEDC hardware directly (ESP-IDF calls, or Arduino functions such as `ledcAttach()` and `analogWrite()`), reserve the Channels and Timers you use so HomeSpan never assigns them:
+
+* `static boolean LedC::reserveChannel(ledc_mode_t mode, ledc_channel_t channel)`
+* `static boolean LedC::reserveTimer(ledc_mode_t mode, ledc_timer_t timer)`
+
+Both methods return true if the reservation succeeds.  They return false, and output an error message, if the index is out of range or if the resource has already been assigned to a LedPin or ServoPin.  Call them before creating any LedPin or ServoPin.  A reserved Timer is never shared, even if its frequency matches.
+
+The *mode*, *channel* and *timer* to reserve are the ones your code actually uses.  For code that calls ESP-IDF directly, they are the values passed to `ledc_timer_config()` and `ledc_channel_config()`.  For example, in a sketch using the Low Speed mode (available on all chips):
+
+```C++
+void setup(){
+  LedC::reserveChannel(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0);     // same mode and channel as in ledc_channel_config() below
+  LedC::reserveTimer(LEDC_LOW_SPEED_MODE,LEDC_TIMER_0);         // same mode and timer as in ledc_timer_config() below
+
+  ledc_timer_config_t myTimer={};                               // my own LEDC code
+  myTimer.speed_mode=LEDC_LOW_SPEED_MODE;
+  myTimer.timer_num=LEDC_TIMER_0;
+  // ...fill in the remaining fields, then call ledc_timer_config(&myTimer) and ledc_channel_config() with channel=LEDC_CHANNEL_0
+
+  new LedPin(18,0,39062,false,11);                              // HomeSpan allocates other channels and timers
+}
+```
+
+On the original ESP32 (which has the High Speed mode) use `LEDC_HIGH_SPEED_MODE` in the same way, protected by `#if SOC_LEDC_SUPPORT_HS_MODE`.
+
+The Arduino functions `ledcAttach()`, `ledcAttachChannel()` and `analogWrite()` choose the mode and Timer for you.  According to the Arduino-ESP32 core source (`esp32-hal-ledc.c`):
+
+* the mode is derived from the channel number: `mode = channel / SOC_LEDC_CHANNEL_NUM`.  On the original ESP32 channels 0-7 are therefore in `LEDC_HIGH_SPEED_MODE` and channels 8-15 in `LEDC_LOW_SPEED_MODE`.  On chips without High Speed mode all channels are in `LEDC_LOW_SPEED_MODE`.  The channel passed to `ledcAttachChannel()` is the one to reserve, translated in this way
+* `ledcAttach()` without a channel uses the lowest channel number that the core has not yet used; if that attempt fails on a channel of the first group (channels 0-7 on the original ESP32), the core also tries a free channel of the second group
+* the core reuses a Timer already used by another of its channels with the same frequency and resolution, otherwise it takes the lowest-numbered Timer that none of its channels uses.  Since the core does not know which Timers HomeSpan or you reserved, check which Timer was selected (for example with the debug output of the core) and reserve that one
+
+For this reason, attach your Arduino-based channels first, then reserve the channels and Timers they use, and only then create LedPin and ServoPin objects.
 
 #### Diagnostic Messages
 
