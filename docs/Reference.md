@@ -459,7 +459,7 @@ The following **optional** `homeSpan` methods are for creating and managing mult
  
 * `boolean runInPoll(void (*f)(void *), void *arg=NULL)`
   * queues the function *f*, to be called as `f(arg)` inside HomeSpan's polling task, and returns immediately
-  * returns *true* if the function was queued; returns *false* if *f* is NULL, if the queue (16 entries) is full, or if the method is called before `homeSpan.begin()`
+  * returns *true* if the function was queued; returns *false* if *f* is NULL or if the queue (16 entries) is full.  A function queued before polling starts (for example from `setup()`) runs in the first polling cycle
   * never blocks the calling task
   * can be called from any task, including HomeSpan's polling task (in which case *f* runs in the next polling cycle).  **Do not** call from an ISR
   * functions run in the order queued.  Each polling cycle runs at most the functions that were already queued when the cycle started, so a function that queues itself again does not stall polling
