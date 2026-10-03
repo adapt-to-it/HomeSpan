@@ -38,14 +38,14 @@ Creating an instance of this **class** configures the specified *pin* to output 
   * returns the fading status of an LedPin.  Return values are as follows:
   
     * **LedPin::NOT_FADING** - the LedPin is not currently fading
-    * **LedPin::FADING** - fading on LedPin is currently in progress and cannot be changed/stopped
+    * **LedPin::FADING** - fading on LedPin is currently in progress (or a new fade is pending).  If the end of a fade is not detected within twice the requested fade time plus a margin, the fade is considered finished, so a stuck state cannot persist
     * **LedPin::COMPLETED** - fading has just completed  
       * once this value is returned, subsequent calls to `fadeStatus()` will return **LedPin::NOT_FADING** (unless you called `fade()` again)
       * by checking for `fadeStatus()==LedPin::COMPLETED` in a `loop()` method, you can thus trigger a new action (if desired) once fading is completed
   
 * `boolean isFading()`
 
-  * returns true if a fade is in progress or a fade request is pending, false otherwise
+  * returns true if a fade is in progress or a fade request is pending, false otherwise.  A fade whose end is not detected within twice the requested fade time plus one PWM cycle plus 500 ms is considered finished (protection against a stuck state)
   * this method only reads the state (unlike `fadeStatus()`, it never changes it) and can be called from any task
 
 * `float getLevel()`
@@ -149,7 +149,7 @@ On the original ESP32 (which has the High Speed mode) use `LEDC_HIGH_SPEED_MODE`
 The Arduino functions `ledcAttach()`, `ledcAttachChannel()` and `analogWrite()` choose the mode and Timer for you.  According to the Arduino-ESP32 core source (`esp32-hal-ledc.c`):
 
 * the mode is derived from the channel number: `mode = channel / SOC_LEDC_CHANNEL_NUM`.  On the original ESP32 channels 0-7 are therefore in `LEDC_HIGH_SPEED_MODE` and channels 8-15 in `LEDC_LOW_SPEED_MODE`.  On chips without High Speed mode all channels are in `LEDC_LOW_SPEED_MODE`.  The channel passed to `ledcAttachChannel()` is the one to reserve, translated in this way
-* `ledcAttach()` without a channel uses the lowest channel number that the core has not yet used
+* `ledcAttach()` without a channel uses the lowest channel number that the core has not yet used; if that attempt fails on a channel of the first group (channels 0-7 on the original ESP32), the core also tries a free channel of the second group
 * the core reuses a Timer already used by another of its channels with the same frequency and resolution, otherwise it takes the lowest-numbered Timer that none of its channels uses.  Since the core does not know which Timers HomeSpan or you reserved, check which Timer was selected (for example with the debug output of the core) and reserve that one
 
 For this reason, attach your Arduino-based channels first, then reserve the channels and Timers they use, and only then create LedPin and ServoPin objects.

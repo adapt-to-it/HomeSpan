@@ -259,6 +259,9 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
 
   if(fadeOverdue()){                                // the end-of-fade callback never arrived: consider the fade finished
     ESP_LOGW(PWM_TAG,"LedPin=%d: fade end not detected - assuming fade is finished",channel->gpio_num);
+#if SOC_LEDC_SUPPORT_FADE_STOP
+    ledc_fade_stop(channel->speed_mode,channel->channel);     // harmless if the fade has really ended; return value ignored
+#endif
     cancelPending();
     fadeState=NOT_FADING;
   }
@@ -301,6 +304,9 @@ int LedPin::fadeStatus(){
   std::lock_guard<std::recursive_mutex> lock(mux);
 
   if(fadeOverdue()){                                // the end-of-fade callback never arrived: consider the fade finished
+#if SOC_LEDC_SUPPORT_FADE_STOP
+    ledc_fade_stop(channel->speed_mode,channel->channel);     // harmless if the fade has really ended; return value ignored
+#endif
     cancelPending();
     fadeState=NOT_FADING;
   }
