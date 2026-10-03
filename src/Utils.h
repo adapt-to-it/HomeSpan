@@ -40,6 +40,16 @@ char *readSerial(char *c, int max, uint32_t idleTimeout=0);   // read serial por
 String mask(char *c, int n);          // simply utility that creates a String from 'c' with all except the first and last 'n' characters replaced by '*'
 char *stripBackslash(char *c);        // strips backslashes out of c (Apple unecessesarily "escapes" forward slashes in JSON)
 const char *resetReason();            // returns literal string description of esp_reset_reason()
+void logLock();                       // takes the recursive mutex shared by all LOG0/LOG1/LOG2 calls (used by the macros in Settings.h)
+void logUnlock();                     // releases the mutex taken by logLock()
+void logPrintf(const char *format, ...) __attribute__((format(printf,1,2)));   // locks, calls Serial.printf, unlocks (used by LOGn macros with 2 or more arguments)
+void logPrint(const char *s);         // non-template overload for strings, so literals of different lengths share one function
+void logPrint(char *s);               // same, so non-const char pointers do not select the template
+template <class T> void logPrint(const T& val){   // locks, calls Serial.print, unlocks (used by LOGn macros with 1 argument)
+  logLock();
+  Serial.print(val);
+  logUnlock();
+}
 }
 
 /////////////////////////////////////////////////

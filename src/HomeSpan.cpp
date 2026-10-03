@@ -114,6 +114,7 @@ void Span::init(){
   delay(1);                                               // required to yield (prevents crashing)
   
   networkEventQueue=xQueueCreate(10,sizeof(arduino_event_t));             // queue to transmit network events
+  runQueue=xQueueCreate(RUN_QUEUE_SIZE,sizeof(RunItem));                  // queue of functions to run in poll task (see runInPoll)
   
   Network.onEvent([](arduino_event_t *event){                             // only queue events handled in networkCallback() so that unrelated events cannot fill the queue
     switch(event->event_id){                                              // and cause critical events (e.g. GOT_IP or DISCONNECTED) to be dropped while poll() is busy
@@ -241,6 +242,10 @@ void Span::pollTask() {
     isInitialized=true;    
     
   } // isInitialized
+
+  RunItem runItem;
+  for(UBaseType_t n=uxQueueMessagesWaiting(runQueue); n>0 && xQueueReceive(runQueue, &runItem, (TickType_t)0); n--)       // run only items present at start, so a function that re-queues itself cannot stall poll
+    runItem.f(runItem.arg);
 
   if(!ethernetEnabled && strlen(network.wifiData.ssid) && !(connected%2) && (int32_t)(millis()-alarmConnect)>0){                  // rollover-safe comparison
     if(verboseWifiReconnect)
@@ -483,8 +488,7 @@ void Span::networkCallback(const arduino_event_t &event){
         connected++;
         if(connected==1)
           configureNetwork();
-        if(connectionCallback)
-          connectionCallback((connected+1)/2);
+        dispatchCallback(CB_CONNECTION,(connected+1)/2);
         if(rescanInitialTime>0){
           rescanAlarm=millis()+rescanInitialTime;
           rescanStatus=RESCAN_PENDING;
@@ -530,8 +534,7 @@ void Span::networkCallback(const arduino_event_t &event){
         connected++;
         if(connected==1)
           configureNetwork();
-        if(connectionCallback)
-          connectionCallback((connected+1)/2);
+        dispatchCallback(CB_CONNECTION,(connected+1)/2);
         resetStatus();     
       }
     break;
@@ -947,8 +950,7 @@ void Span::processSerialCommand(const char *c){
       LOG0("\nDEVICE NOT YET PAIRED -- PLEASE PAIR WITH HOMEKIT APP\n\n");
       mdns_service_txt_item_set("_hap","_tcp","sf","1");                        // set Status Flag = 1 (Table 6-8)
 
-      if(homeSpan.pairCallback)
-        homeSpan.pairCallback(false);
+      dispatchCallback(CB_PAIR,false);
 
       resetStatus();      
     }
@@ -1454,6 +1456,102 @@ void Span::resetStatusDuration(){
 
 ///////////////////////////////
 
+boolean Span::runInPoll(void (*f)(void *), void *arg){
+
+  if(!f || !runQueue)
+    return(false);
+
+  RunItem item={f,arg};
+  return(xQueueSend(runQueue, &item, (TickType_t)0)==pdTRUE);       // never blocks; returns false if queue is full
+}
+
+///////////////////////////////
+
+Span& Span::setCallbackTask(uint32_t stackSize, uint32_t priority, uint32_t core){
+
+  if(callbackQueue)                                   // task already created
+    return(*this);
+
+  callbackQueue=xQueueCreate(CALLBACK_QUEUE_SIZE,sizeof(CallbackItem));
+  if(!callbackQueue)
+    return(*this);
+
+  xTaskCreateUniversal([](void *parms){
+    CallbackItem item;
+    for(;;){
+      if(xQueueReceive(homeSpan.callbackQueue, &item, portMAX_DELAY))
+        homeSpan.callUserCallback(item);
+    }
+  }, "hsCallback", stackSize, NULL, priority, NULL, core);
+
+  return(*this);
+}
+
+///////////////////////////////
+
+void Span::dispatchCallback(CallbackType type, int32_t arg){
+
+  CallbackItem item={type,arg};
+
+  boolean isSet=false;
+  switch(type){
+    case CB_STATUS: isSet=(statusCallback!=NULL); break;
+    case CB_CONNECTION: isSet=(connectionCallback!=NULL); break;
+    case CB_PAIR: isSet=(pairCallback!=NULL); break;
+    case CB_CONTROLLER: isSet=(controllerCallback!=NULL); break;
+  }
+
+  if(!isSet)
+    return;
+
+  if(!callbackQueue){                                 // callback task not active: call directly
+    callUserCallback(item);
+    return;
+  }
+
+  if(xQueueSend(callbackQueue, &item, (TickType_t)0)!=pdTRUE)
+    LOG0("\n*** WARNING: Callback queue is full - callback dropped\n\n");
+}
+
+///////////////////////////////
+
+void Span::callUserCallback(const CallbackItem &item){
+
+  switch(item.type){
+    case CB_STATUS:
+      if(statusCallback)
+        statusCallback((HS_STATUS)item.arg);
+    break;
+    case CB_CONNECTION:
+      if(connectionCallback)
+        connectionCallback(item.arg);
+    break;
+    case CB_PAIR:
+      if(pairCallback)
+        pairCallback(item.arg!=0);
+    break;
+    case CB_CONTROLLER:
+      if(controllerCallback)
+        controllerCallback();
+    break;
+  }
+}
+
+///////////////////////////////
+
+void Span::addNotification(SpanCharacteristic *c){
+
+  SpanBuf sb;                             // create SpanBuf object
+  sb.characteristic=c;                    // set characteristic
+  sb.status=StatusCode::OK;               // set status
+  sb.val=const_cast<char *>("");          // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
+
+  std::lock_guard<std::mutex> lock(notifyMutex);
+  Notifications.push_back(sb);            // store SpanBuf in Notifications vector
+}
+
+///////////////////////////////
+
 void Span::setStatus(HS_STATUS hst){
 
   std::unique_lock writeLock(hsStatusMux);          // wait for mux to be unlocked and then lock *exclusively* so write can proceed uninterrupted
@@ -1491,8 +1589,7 @@ void Span::setStatus(HS_STATUS hst){
 
   writeLock.unlock();                       // unlock before calling optional callback
 
-  if(statusCallback)                        // call optional user callback if defined
-    statusCallback(hsStatus);
+  dispatchCallback(CB_STATUS,hsStatus);     // call optional user callback if defined
 }
 
 ///////////////////////////////
@@ -2359,10 +2456,13 @@ void SpanCharacteristic::uvStream(UVal &u){
 ///////////////////////////////
 
 void SpanCharacteristic::uvSet(UVal &dest, UVal &src){
-  if(format>=FORMAT::STRING)
+  if(format>=FORMAT::STRING){
     uvSet(dest,(const char *)src.STRING);
-  else
+  } else {
+    portENTER_CRITICAL(&valMux);          // only copy bytes inside critical section
     dest=src;
+    portEXIT_CRITICAL(&valMux);
+  }
 }
 
 ///////////////////////////////
@@ -2523,11 +2623,7 @@ void SpanCharacteristic::setValFinish(boolean notify){
 
   if(notify){
     if((perms&EV) && (updateFlag!=2)){        // only broadcast notification if EV permission is set AND update is NOT being done in context of write-response    
-      SpanBuf sb;                             // create SpanBuf object
-      sb.characteristic=this;                 // set characteristic          
-      sb.status=StatusCode::OK;               // set status
-      sb.val=const_cast<char *>("");             // set dummy (never modified) "val" so that printfNotify knows to consider this "update" (points to static storage, not to a local that goes out of scope)
-      homeSpan.Notifications.push_back(sb);   // store SpanBuf in Notifications vector
+      homeSpan.addNotification(this);         // store SpanBuf in Notifications vector (protected by mutex)
     }
 
     if(nvsKey){
@@ -2949,8 +3045,12 @@ void SpanWebLog::init(uint16_t maxEntries, const char *serv, const char *tz, con
 void SpanWebLog::initTime(void *args){
   SpanWebLog *wLog = (SpanWebLog *)args;
   
-  WEBLOG("Acquiring Time from %s (%s)",wLog->timeServer,wLog->timeZone,wLog->waitTime/1000);
-  configTzTime(wLog->timeZone,wLog->timeServer);
+  if(esp_sntp_enabled()){
+    WEBLOG("Using Time Service already configured by sketch");
+  } else {
+    WEBLOG("Acquiring Time from %s (%s)",wLog->timeServer,wLog->timeZone,wLog->waitTime/1000);
+    configTzTime(wLog->timeZone,wLog->timeServer);
+  }
   struct tm timeinfo;
   if(getLocalTime(&timeinfo,wLog->waitTime)){
     strftime(wLog->bootTime,sizeof(wLog->bootTime),"%c",&timeinfo);
@@ -3123,6 +3223,8 @@ int SpanOTA::otaPercent;
 boolean SpanOTA::safeLoad;
 boolean SpanOTA::enabled=false;
 boolean SpanOTA::auth;
+
+portMUX_TYPE SpanCharacteristic::valMux=portMUX_INITIALIZER_UNLOCKED;
 
 ///////////////////////////////
 //        SpanPoint          //
