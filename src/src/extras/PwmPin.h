@@ -46,11 +46,20 @@
 #include <driver/ledc.h>
 #include <soc/soc_caps.h>
 #include <mutex>
+#include <esp_timer.h>
 #include "Blinker.h"
 
 [[maybe_unused]] static const char* PWM_TAG = "PwmPin";
 
 #define DEFAULT_PWM_FREQ     5000
+
+#ifndef LEDPIN_FADE_SEGMENT_MS
+#define LEDPIN_FADE_SEGMENT_MS  25         // chips without fade stop (original ESP32) run each fade as a sequence of hardware segments of about this length (ms); a new fade() or set() takes effect at the next segment boundary
+#endif
+
+#ifndef LEDPIN_FADE_TASK_PRIORITY
+#define LEDPIN_FADE_TASK_PRIORITY  10      // priority of the ledFade task (original ESP32 only): a task of equal or higher priority that waits for a fade to end without yielding the CPU prevents the fade from advancing
+#endif
 
 /////////////////////////////////////
 
@@ -104,8 +113,8 @@ class LedPin : public LedC {
     volatile int fadeState=NOT_FADING;
     std::recursive_mutex mux;                                          // serializes calls from different tasks on the same object (never taken in ISR context)
     portMUX_TYPE pendingMux=portMUX_INITIALIZER_UNLOCKED;              // protects the pending request below (shared between tasks and ISR)
-    boolean pendingValid=false;                                        // true if a fade request is waiting for the current fade to end
-    boolean pendingQueued=false;                                       // true if the ISR has already handed the pending request to the ledFade task
+    boolean pendingValid=false;                                        // true if a fade or set request is waiting for the current fade (or fade segment) to end
+    boolean pendingQueued=false;                                       // true if the ISR has already handed over to the ledFade task (and with it the pending request, if any)
     float pendingLevel=0;
     uint32_t pendingTime=0;
     int pendingType=ABSOLUTE;
@@ -123,6 +132,22 @@ class LedPin : public LedC {
     int startFade(float level, uint32_t fadeTime, int fadeType);       // starts the hardware fade now (mux must be held, no fade may be in progress)
     boolean cancelPending();                                           // discards the pending request; returns true if it had already been handed to the ledFade task
 #if !SOC_LEDC_SUPPORT_FADE_STOP
+    boolean pendingIsSet=false;                                        // true if the pending request is a set() rather than a fade() (written under pendingMux)
+    uint32_t planStartDuty=0;                                          // fade plan, protected by mux: initial duty, final duty, millis() at plan start, total duration in ms
+    uint32_t planEndDuty=0;
+    uint32_t planStartMs=0;
+    uint32_t planTotalMs=0;
+    volatile boolean lastSegment=false;                                // true if the active hardware segment reaches planEndDuty: read by the ISR, written under pendingMux
+    volatile boolean segWaiting=false;                                 // true while a one-shot timer (not a hardware segment) is armed for a very slow fade: written under pendingMux
+    esp_timer_handle_t segTimer=NULL;                                  // created on first need, never destroyed; accessed only with mux held
+    int runSegment();                                                  // starts the next hardware segment of the plan, or arms the wait timer (mux held, no hardware fade active); returns 0=started, 1=failed, -1=plan finished
+    boolean armWait(uint64_t waitMs);                                  // arms the one-shot timer for waitMs (mux held); returns false if the timer is not available
+    void deliverWait();                                                // hands the pin to the ledFade task if the wait is still armed (exactly once); never called with pendingMux held
+    void wakeWait();                                                   // stops the wait timer and delivers at once, so a new request does not wait for the timer (mux held)
+    void clearWait();                                                  // stops the wait timer and clears the wait flag (mux held)
+    static void segTimerCallback(void *arg);
+    void abortFade();                                                  // driver error in the ledFade task: logs, jumps to the final duty of the plan and completes the fade (mux held)
+    void completeFade();                                               // sets COMPLETED and calls the end-of-fade function (mux held)
     static QueueHandle_t fadeQueue;
     static boolean startFadeTask();
     static void fadeTask(void *arg);
@@ -136,7 +161,7 @@ class LedPin : public LedC {
     int fadeStatus();                                                                           // returns fading state
     boolean isFading();                                                                         // returns true if fading or a fade is pending; no side effects
     float getLevel();                                                                           // returns the current level (0-100) read from the hardware
-    LedPin *setFadeCallback(void (*f)(LedPin *, void *), void *arg=NULL);                      // f is called when a fade ends with no pending request; runs in ISR context: keep it short, no blocking calls, no logging
+    LedPin *setFadeCallback(void (*f)(LedPin *, void *), void *arg=NULL);                      // f is called when a fade ends with no pending request; may run in ISR context, in the ledFade task, or in the task calling fade(): keep it short, no blocking calls, no logging
     
     static void HSVtoRGB(float h, float s, float v, float *r, float *g, float *b );       // converts Hue/Saturation/Brightness to R/G/B
 };

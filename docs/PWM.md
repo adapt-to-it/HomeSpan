@@ -28,9 +28,13 @@ Creating an instance of this **class** configures the specified *pin* to output 
   * this is a **NON-BLOCKING** method and will return immediately.  Fading occurs in the background controlled by the ESP32 hardware
   * if a fade is already in progress, *fade()* sets a new destination without blocking the caller.  The behavior depends on the chip:
     * chips that support stopping a fade (ESP32-S2, S3, C3, C5, C6): the fade in progress is stopped and the new fade starts at once from the current level
-    * ESP32 (original): the hardware cannot change a fade in progress.  The request is stored as *pending* and starts automatically as soon as the current fade ends, from a shared background task named *ledFade* (created on the first pending request).  A newer pending request replaces an older one, so only the last request is executed.  Until the last fade ends, `fadeStatus()` and `isFading()` report fading
+    * ESP32 (original): the hardware cannot change a fade in progress, so *LedPin* runs every fade as a sequence of short hardware segments (`LEDPIN_FADE_SEGMENT_MS`, default 25 ms).  At the end of each segment the shared background task named *ledFade* (created on the first fade) starts the next one.  The new request is stored as *pending* and takes effect at the next segment boundary, that is within one segment.  For fades so slow that the level changes by less than one duty step per segment, *LedPin* starts no hardware segment: a timer waits until the level has to change by one step, so a new destination or a `set()` takes effect within one segment in this case too.  A newer pending request replaces an older one, so only the last request is executed.  Until the last fade ends, `fadeStatus()` and `isFading()` report fading
+    * on the ESP32 (original) every fade is driven by the *ledFade* task, whose priority is `LEDPIN_FADE_TASK_PRIORITY` (default 10).  A task of equal or higher priority that waits for a fade to end in a loop that never yields the CPU prevents the fade from advancing: use `delay()` or a blocking call in such a loop
+    * `LEDPIN_FADE_SEGMENT_MS` and `LEDPIN_FADE_TASK_PRIORITY` can be redefined at compile time, before the library is built
+    * on the ESP32 (original), if the driver fails to start a segment in the *ledFade* task, the level jumps to the final level of the fade, an error is logged and the fade is reported as ended
+    * on the ESP32 (original), a fade to the current level ends at once and sets the status to **LedPin::COMPLETED**
   * this method returns 0 if the fading has started or the request has been accepted, or 1 if the fade could not be started
-  * calling `set()` while a fade is in progress ends the fade and discards any pending request
+  * calling `set()` while a fade is in progress ends the fade and discards any pending request.  On the ESP32 (original) `set()` does not block: the level is applied within one segment (`LEDPIN_FADE_SEGMENT_MS`, default 25 ms), without calling the end-of-fade function
   * use the *fadeStatus* method (below) to determine the current fading status of any given LedPin
 
 * `int fadeStatus()`
@@ -55,7 +59,7 @@ Creating an instance of this **class** configures the specified *pin* to output 
 * `LedPin *setFadeCallback(void (*f)(LedPin *, void *), void *arg=NULL)`
 
   * registers the function *f*, which is called with the LedPin and *arg* when a fade ends and no pending request follows it.  Returns the LedPin itself, so calls can be chained
-  * **the function runs in interrupt (ISR) context**: keep it short, do not call blocking functions, and do not log.  Functions that run in ISR context should be placed in IRAM with `IRAM_ATTR`
+  * **the function can run in interrupt (ISR) context, in the *ledFade* task, or in the task that called `fade()`** (for example when a fade to the current level ends at once): keep it short, do not call blocking functions, and do not log.  Functions that can run in ISR context should be placed in IRAM with `IRAM_ATTR`
 
 * `int getPin()`
 

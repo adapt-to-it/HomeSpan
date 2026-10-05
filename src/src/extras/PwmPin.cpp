@@ -202,18 +202,14 @@ void LedPin::set(float level){
 
   std::lock_guard<std::recursive_mutex> lock(mux);
 
+#if SOC_LEDC_SUPPORT_FADE_STOP
   boolean wasQueued=cancelPending();                // a pending request is always discarded
   uint32_t duty=level*maxDuty()/100.0;
 
   if(fadeState==FADING && !wasQueued){              // a fade is in progress: stop it
-#if SOC_LEDC_SUPPORT_FADE_STOP
     ledc_fade_stop(channel->speed_mode,channel->channel);
     setDuty(duty);
     fadeState=NOT_FADING;
-#else
-    channel->duty=duty;                             // no fade stop: stop it by fully re-configuring the channel (same behavior as before)
-    ledc_channel_config(channel);
-#endif
     return;
   }
 
@@ -221,9 +217,48 @@ void LedPin::set(float level){
     fadeState=NOT_FADING;
 
   setDuty(duty);
+#else
+  if(fadeOverdue()){                                // the end-of-segment callback never arrived: consider the fade finished
+    ESP_LOGW(PWM_TAG,"LedPin=%d: fade end not detected - assuming fade is finished",channel->gpio_num);
+    clearWait();
+    cancelPending();
+    fadeState=NOT_FADING;
+  }
+
+  boolean wasQueued=false;
+  boolean stored=false;
+  boolean waiting=false;
+
+  portENTER_CRITICAL(&pendingMux);
+  if(fadeState==FADING && !pendingQueued){          // a hardware segment is active: the ledFade task applies the request at its end
+    pendingLevel=level;
+    pendingIsSet=true;
+    pendingValid=true;                              // replaces any previous request
+    waiting=segWaiting;
+    stored=true;
+  } else {
+    wasQueued=pendingQueued;                        // no active segment: a pending request is discarded
+    pendingValid=false;
+    pendingQueued=false;
+  }
+  portEXIT_CRITICAL(&pendingMux);
+
+  if(stored){
+    if(waiting)                                     // very slow fade between two segments: the request takes effect now, not after the wait
+      wakeWait();
+    return;
+  }
+
+  if(wasQueued)                                     // the segment had already ended and the ledFade task never continued the fade
+    fadeState=NOT_FADING;
+
+  setDuty(level*maxDuty()/100.0);
+#endif
 }
 
 ///////////////////
+
+#if SOC_LEDC_SUPPORT_FADE_STOP
 
 int LedPin::startFade(float level, uint32_t fadeTime, int fadeType){
 
@@ -241,6 +276,229 @@ int LedPin::startFade(float level, uint32_t fadeTime, int fadeType){
   }
   return(0);
 }
+
+#else
+
+int LedPin::startFade(float level, uint32_t fadeTime, int fadeType){
+
+  uint32_t end=level*maxDuty()/100.0;
+  if(end>maxDuty())
+    end=maxDuty();
+
+  uint32_t cur=ledc_get_duty(channel->speed_mode,channel->channel);
+
+  if(fadeType==PROPORTIONAL){
+    double t=(double)fadeTime*fabs((double)cur-(double)end)/(double)maxDuty();
+    fadeTime=(t>=4294967295.0)?0xFFFFFFFF:(uint32_t)t;
+  }
+
+  if(cur==end){                                     // already at the requested level: no hardware fade
+    setDuty(end);                                   // the duty read back may predate a set() not yet latched by the hardware: make the level explicit
+    completeFade();
+    return(0);
+  }
+
+  planStartDuty=cur;
+  planEndDuty=end;
+  planStartMs=millis();
+  planTotalMs=fadeTime;
+
+  int r=runSegment();
+  if(r<0){
+    completeFade();
+    return(0);
+  }
+  return(r);
+}
+
+///////////////////
+
+void LedPin::completeFade(){
+
+  portENTER_CRITICAL(&pendingMux);
+  fadeState=COMPLETED;
+  void (*cb)(LedPin *, void *)=endCallback;
+  void *cbArg=endArg;
+  portEXIT_CRITICAL(&pendingMux);
+
+  if(cb)
+    cb(this,cbArg);
+}
+
+///////////////////
+
+void LedPin::abortFade(){
+
+  ESP_LOGE(PWM_TAG,"LedPin=%d: can't start fade segment - jumping to the final level",channel->gpio_num);
+  setDuty(planEndDuty);
+  completeFade();
+}
+
+///////////////////
+
+boolean LedPin::armWait(uint64_t waitMs){
+
+  if(waitMs<1)
+    waitMs=1;
+
+  if(!segTimer){
+    esp_timer_create_args_t args={};
+    args.callback=segTimerCallback;
+    args.arg=this;
+    args.dispatch_method=ESP_TIMER_TASK;
+    args.name="ledSeg";
+    if(esp_timer_create(&args,&segTimer)!=ESP_OK){
+      segTimer=NULL;
+      ESP_LOGE(PWM_TAG,"LedPin=%d: can't create wait timer - using a long hardware segment",channel->gpio_num);
+      return(false);
+    }
+  }
+
+  esp_timer_stop(segTimer);                         // no-op if not running; start_once requires an idle timer
+
+  fadeStartMs=millis();                             // watchdog (fadeOverdue) covers the wait
+  fadeDurationMs=(uint32_t)waitMs;
+  portENTER_CRITICAL(&pendingMux);
+  lastSegment=false;
+  segWaiting=true;
+  fadeState=FADING;
+  portEXIT_CRITICAL(&pendingMux);
+
+  if(esp_timer_start_once(segTimer,waitMs*1000ULL)!=ESP_OK){
+    portENTER_CRITICAL(&pendingMux);
+    segWaiting=false;
+    portEXIT_CRITICAL(&pendingMux);
+    ESP_LOGE(PWM_TAG,"LedPin=%d: can't start wait timer - using a long hardware segment",channel->gpio_num);
+    return(false);
+  }
+
+  return(true);
+}
+
+///////////////////
+
+void LedPin::deliverWait(){
+
+  boolean mine=false;
+
+  portENTER_CRITICAL(&pendingMux);                  // the flag decides who delivers: timer callback or a new request
+  if(fadeState==FADING && segWaiting){
+    segWaiting=false;
+    pendingQueued=true;
+    mine=true;
+  }
+  portEXIT_CRITICAL(&pendingMux);
+
+  if(!mine)
+    return;
+
+  LedPin *p=this;
+  if(fadeQueue && xQueueSend(fadeQueue,&p,0)==pdTRUE)
+    return;
+
+  portENTER_CRITICAL(&pendingMux);                  // queue full: fadeOverdue() recovers the state
+  pendingQueued=false;
+  portEXIT_CRITICAL(&pendingMux);
+}
+
+///////////////////
+
+void LedPin::wakeWait(){
+
+  if(segTimer)
+    esp_timer_stop(segTimer);
+  deliverWait();
+}
+
+///////////////////
+
+void LedPin::clearWait(){
+
+  if(segTimer)
+    esp_timer_stop(segTimer);
+  portENTER_CRITICAL(&pendingMux);
+  segWaiting=false;
+  portEXIT_CRITICAL(&pendingMux);
+}
+
+///////////////////
+
+void LedPin::segTimerCallback(void *arg){
+  ((LedPin *)arg)->deliverWait();                   // runs in the esp_timer task, not in ISR context
+}
+
+///////////////////
+
+int LedPin::runSegment(){
+
+  const uint64_t SEG=LEDPIN_FADE_SEGMENT_MS;
+
+  uint32_t cur=ledc_get_duty(channel->speed_mode,channel->channel);
+
+  if(cur==planEndDuty)
+    return(-1);
+
+  uint32_t elapsed=millis()-planStartMs;
+  uint64_t total=planTotalMs;
+  int64_t dir=(planEndDuty>cur)?1:-1;
+  uint32_t target;
+  uint64_t duration;
+
+  // duty on the ideal straight line at time t (0<t<total), rounded; double avoids overflow for any total and any duty
+  auto line=[&](uint64_t t)->uint32_t{
+    double v=(double)planStartDuty+((double)planEndDuty-(double)planStartDuty)*(double)t/(double)total;
+    if(v<0)
+      v=0;
+    return((uint32_t)(v+0.5));
+  };
+
+  if(elapsed>=total){                               // plan time is over: final segment to the end
+    target=planEndDuty;
+    duration=SEG;
+  } else {
+    uint64_t tNext=(uint64_t)elapsed+SEG;
+    if(tNext>total)
+      tNext=total;
+
+    target=(tNext==total)?planEndDuty:line(tNext);
+
+    if(tNext<total && (int64_t)((int64_t)target-(int64_t)cur)*dir<=0){     // very slow fade: less than one duty step in this segment
+      double ratio=((double)cur+(double)dir-(double)planStartDuty)/((double)planEndDuty-(double)planStartDuty);
+      uint64_t tStep=0;                             // 0: the ideal line has already reached cur+/-1
+      if(ratio>0){                                  // time at which the ideal line reaches cur+/-1
+        double t=ceil((double)total*ratio);
+        tStep=(t>=(double)total)?total:(uint64_t)t;
+      }
+      if(tStep>tNext){                              // no hardware fade: wait with a timer, then continue with a normal segment
+        if(armWait(tStep-elapsed))
+          return(0);
+        tNext=tStep;                                // timer not available: fall back to a longer hardware segment
+      }
+      target=(tNext==total)?planEndDuty:line(tNext);
+      if(tNext<total && (int64_t)((int64_t)target-(int64_t)cur)*dir<=0)    // rounding left the target at the current duty
+        target=(uint32_t)((int64_t)cur+dir);
+    }
+
+    duration=tNext-elapsed;
+    if(duration<1)
+      duration=1;
+  }
+
+  portENTER_CRITICAL(&pendingMux);
+  lastSegment=(target==planEndDuty);
+  portEXIT_CRITICAL(&pendingMux);
+
+  fadeStartMs=millis();                             // watchdog (fadeOverdue) covers the segment, not the whole plan
+  fadeDurationMs=(uint32_t)duration;
+  fadeState=FADING;
+  if(ledc_set_fade_time_and_start(channel->speed_mode,channel->channel,target,(uint32_t)duration,LEDC_FADE_NO_WAIT)!=ESP_OK){
+    fadeState=NOT_FADING;
+    return(1);
+  }
+  return(0);
+}
+
+#endif
 
 ///////////////////
 
@@ -261,10 +519,17 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
     ESP_LOGW(PWM_TAG,"LedPin=%d: fade end not detected - assuming fade is finished",channel->gpio_num);
 #if SOC_LEDC_SUPPORT_FADE_STOP
     ledc_fade_stop(channel->speed_mode,channel->channel);     // harmless if the fade has really ended; return value ignored
+#else
+    clearWait();
 #endif
     cancelPending();
     fadeState=NOT_FADING;
   }
+
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+  if(!startFadeTask())
+    return(1);
+#endif
 
   if(fadeState==FADING){                            // fading already in progress
 #if SOC_LEDC_SUPPORT_FADE_STOP
@@ -272,22 +537,25 @@ int LedPin::fade(float level, uint32_t fadeTime, int fadeType){
       return(1);
     fadeState=NOT_FADING;
 #else
-    if(!startFadeTask())
-      return(1);
-
     boolean stored=false;
+    boolean waiting=false;
     portENTER_CRITICAL(&pendingMux);
     if(fadeState==FADING){                          // re-check: the fade may have ended in the meantime
       pendingLevel=level;
       pendingTime=fadeTime;
       pendingType=fadeType;
+      pendingIsSet=false;
       pendingValid=true;                            // replaces any previous request
+      waiting=segWaiting;
       stored=true;
     }
     portEXIT_CRITICAL(&pendingMux);
 
-    if(stored)
+    if(stored){
+      if(waiting)                                   // very slow fade between two segments: the request takes effect now, not after the wait
+        wakeWait();
       return(0);
+    }
 #endif
   }
 
@@ -306,6 +574,8 @@ int LedPin::fadeStatus(){
   if(fadeOverdue()){                                // the end-of-fade callback never arrived: consider the fade finished
 #if SOC_LEDC_SUPPORT_FADE_STOP
     ledc_fade_stop(channel->speed_mode,channel->channel);     // harmless if the fade has really ended; return value ignored
+#else
+    clearWait();
 #endif
     cancelPending();
     fadeState=NOT_FADING;
@@ -358,7 +628,11 @@ bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
 
   LedPin *p=(LedPin *)arg;
   boolean pending;
+#if !SOC_LEDC_SUPPORT_FADE_STOP
+  boolean last;
+#endif
 
+#if SOC_LEDC_SUPPORT_FADE_STOP
   portENTER_CRITICAL_ISR(&p->pendingMux);
   void (*cb)(LedPin *, void *)=p->endCallback;      // read once, together with its argument
   void *cbArg=p->endArg;
@@ -374,13 +648,39 @@ bool IRAM_ATTR LedPin::fadeCallback(const ledc_cb_param_t *param, void *arg){
       cb(p,cbArg);
     return(false);
   }
+#else
+  portENTER_CRITICAL_ISR(&p->pendingMux);
+  void (*cb)(LedPin *, void *)=p->endCallback;      // read once, together with its argument
+  void *cbArg=p->endArg;
+  pending=p->pendingValid;
+  last=p->lastSegment;                              // read here, together with the rest: the task may change it once the pin is delivered
+  boolean done=(last && !pending);
+  if(done)
+    p->fadeState=COMPLETED;
+  else
+    p->pendingQueued=true;                          // state stays FADING: the ledFade task applies the pending request or starts the next segment
+  portEXIT_CRITICAL_ISR(&p->pendingMux);
+
+  if(done){
+    if(cb)
+      cb(p,cbArg);
+    return(false);
+  }
+#endif
 
 #if !SOC_LEDC_SUPPORT_FADE_STOP
   BaseType_t woken=pdFALSE;
   if(fadeQueue && xQueueSendFromISR(fadeQueue,&p,&woken)==pdTRUE)
     return(woken==pdTRUE);
 
-  portENTER_CRITICAL_ISR(&p->pendingMux);           // queue full: discard the pending request
+  if(!last){                                        // queue full at an intermediate segment: the fade is not over, so no COMPLETED and no callback;
+    portENTER_CRITICAL_ISR(&p->pendingMux);         // state stays FADING and fadeOverdue() recovers it in the next fade(), set() or fadeStatus()
+    p->pendingQueued=false;
+    portEXIT_CRITICAL_ISR(&p->pendingMux);
+    return(false);
+  }
+
+  portENTER_CRITICAL_ISR(&p->pendingMux);           // queue full at the last segment: discard the pending request
   p->pendingValid=false;
   p->pendingQueued=false;
   p->fadeState=COMPLETED;
@@ -406,13 +706,13 @@ boolean LedPin::startFadeTask(){
   if(fadeQueue)
     return(true);
 
-  QueueHandle_t q=xQueueCreate((int)LEDC_CHANNEL_MAX*(int)LEDC_SPEED_MODE_MAX,sizeof(LedPin *));
+  QueueHandle_t q=xQueueCreate(2*(int)LEDC_CHANNEL_MAX*(int)LEDC_SPEED_MODE_MAX,sizeof(LedPin *));
   if(!q){
     ESP_LOGE(PWM_TAG,"Can't create fade queue");
     return(false);
   }
 
-  if(xTaskCreate(fadeTask,"ledFade",3072,q,2,NULL)!=pdPASS){
+  if(xTaskCreate(fadeTask,"ledFade",3072,q,LEDPIN_FADE_TASK_PRIORITY,NULL)!=pdPASS){
     vQueueDelete(q);
     ESP_LOGE(PWM_TAG,"Can't create ledFade task");
     return(false);
@@ -444,21 +744,43 @@ void LedPin::startPending(){
   float level;
   uint32_t fadeTime;
   int fadeType;
+  boolean delivered;
   boolean valid;
+  boolean isSet;
 
   portENTER_CRITICAL(&pendingMux);                  // copy fields only
-  valid=pendingValid && pendingQueued;             // a request not yet handed over by the ISR must wait for the current fade to end
+  delivered=pendingQueued;                          // a wake-up not delivered by the ISR is a stale queue entry: a hardware segment may be active
+  valid=pendingValid;
+  isSet=pendingIsSet;
   level=pendingLevel;
   fadeTime=pendingTime;
   fadeType=pendingType;
-  if(valid){
+  if(delivered){
     pendingValid=false;
     pendingQueued=false;
   }
   portEXIT_CRITICAL(&pendingMux);
 
-  if(valid)                                         // otherwise the request was cancelled or is not yet startable (stale queue entry)
-    startFade(level,fadeTime,fadeType);
+  if(!delivered || fadeState!=FADING)               // stale queue entry, or the fade was cancelled
+    return;
+
+  if(valid && isSet){                               // set() requested during the fade
+    setDuty(level*maxDuty()/100.0);
+    fadeState=NOT_FADING;
+    return;
+  }
+
+  if(valid){                                        // new fade replaces the plan
+    if(startFade(level,fadeTime,fadeType)!=0)       // driver error in this task: nobody else can report it
+      abortFade();
+    return;
+  }
+
+  int r=runSegment();                               // continue the current plan
+  if(r<0)
+    completeFade();
+  else if(r>0)
+    abortFade();
 }
 
 #endif
