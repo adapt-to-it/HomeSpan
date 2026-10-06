@@ -4,6 +4,8 @@ HomeSpan includes a light-weight Command-Line Interface (CLI) for developers tha
 
 > :exclamation: When using the Serial Monitor, please make sure you set the baud rate to match whatever you specified in the `Serial.begin()` function in your HomeSpan sketch.  In addition, you'll need to set the Serial Monitor to transmit a \<newline\> as the line ending.
 
+> :exclamation: A command must be sent as a complete line.  If HomeSpan receives part of a command and no further characters arrive within 2 seconds, it discards the partial command so that the rest of the device keeps running.  Terminals that transmit each character as it is typed (rather than the whole line at once) may therefore lose a command that is typed slowly.
+
 ### Startup Diagnostics
 
 At startup, HomeSpan:

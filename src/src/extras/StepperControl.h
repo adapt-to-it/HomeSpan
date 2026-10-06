@@ -65,17 +65,19 @@ class StepperControl {
     uint32_t msDelay;
     action_t action;
     endAction_t endAction;
+    uint32_t seq;
   };
 
   struct downLink_t {
     int stepsRemaining=0;
     int position=0;
-    boolean ack=false;
+    uint32_t ackSeq=0;
   };
   
   float accelSteps=1;
   float accelSize=0;
   downLink_t downLinkData;
+  uint32_t cmdSeq=0;
 
   TaskHandle_t motorTaskHandle;
   QueueHandle_t upLinkQueue;

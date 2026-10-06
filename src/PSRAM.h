@@ -30,10 +30,26 @@
 #ifndef HS_MALLOC
 
 #if defined(BOARD_HAS_PSRAM)
-#define HS_MALLOC ps_malloc
-#define HS_CALLOC ps_calloc
-#define HS_REALLOC ps_realloc
-#define ps_new(X) new(ps_malloc(sizeof(X)))X
+static inline void *hs_malloc(size_t size){                         // prefer PSRAM, fall back to internal heap
+  void *p=ps_malloc(size);
+  return(p!=NULL?p:malloc(size));
+}
+static inline void *hs_calloc(size_t n, size_t size){
+  void *p=ps_calloc(n,size);
+  return(p!=NULL?p:calloc(n,size));
+}
+static inline void *hs_realloc(void *ptr, size_t size){
+  if(size==0){                                                     // realloc to zero frees the block: handle here to avoid a double free on fallback
+    free(ptr);
+    return(NULL);
+  }
+  void *p=ps_realloc(ptr,size);
+  return(p!=NULL?p:realloc(ptr,size));                             // on failure the original block is still valid
+}
+#define HS_MALLOC hs_malloc
+#define HS_CALLOC hs_calloc
+#define HS_REALLOC hs_realloc
+#define ps_new(X) new(HS_MALLOC(sizeof(X)))X
 #else
 #define HS_MALLOC malloc
 #define HS_CALLOC calloc

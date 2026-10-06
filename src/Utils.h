@@ -36,10 +36,20 @@
 
 namespace Utils {
 
-char *readSerial(char *c, int max);   // read serial port into 'c' until <newline>, but storing only first 'max' characters (the rest are discarded)
+char *readSerial(char *c, int max, uint32_t idleTimeout=0);   // read serial port into 'c' until <newline>, but storing only first 'max' characters (the rest are discarded).  If idleTimeout>0 and no character arrives for more than idleTimeout ms, discards input, sets c[0]='\0' and returns; if 0, waits indefinitely
 String mask(char *c, int n);          // simply utility that creates a String from 'c' with all except the first and last 'n' characters replaced by '*'
 char *stripBackslash(char *c);        // strips backslashes out of c (Apple unecessesarily "escapes" forward slashes in JSON)
 const char *resetReason();            // returns literal string description of esp_reset_reason()
+void logLock();                       // takes the recursive mutex shared by all LOG0/LOG1/LOG2 calls (used by the macros in Settings.h)
+void logUnlock();                     // releases the mutex taken by logLock()
+void logPrintf(const char *format, ...) __attribute__((format(printf,1,2)));   // locks, calls Serial.printf, unlocks (used by LOGn macros with 2 or more arguments)
+void logPrint(const char *s);         // non-template overload for strings, so literals of different lengths share one function
+void logPrint(char *s);               // same, so non-const char pointers do not select the template
+template <class T> void logPrint(const T& val){   // locks, calls Serial.print, unlocks (used by LOGn macros with 1 argument)
+  logLock();
+  Serial.print(val);
+  logUnlock();
+}
 }
 
 /////////////////////////////////////////////////
@@ -57,7 +67,7 @@ class TempBuffer {
   public:
   
   TempBuffer(size_t _nElements=1) : nElements(_nElements) {
-    buf=(bufType *)HS_MALLOC(nElements*sizeof(bufType));
+    buf=(bufType *)HS_MALLOC((nElements>0?nElements:1)*sizeof(bufType));       // allocate at least one element so a zero-size request does not fail
     if(buf==NULL){
       Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",nElements*sizeof(bufType));
       while(1);
@@ -86,7 +96,7 @@ class TempBuffer {
   }
 
   void resize(size_t _nElements){                                         // resizes buffer (preserving existing contents up to new size)
-    bufType *p=(bufType *)HS_REALLOC(buf,_nElements*sizeof(bufType));
+    bufType *p=(bufType *)HS_REALLOC(buf,(_nElements>0?_nElements:1)*sizeof(bufType));
     if(p==NULL){
       Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",_nElements*sizeof(bufType));
       while(1);

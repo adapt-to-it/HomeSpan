@@ -32,6 +32,10 @@
 tlv8_t::tlv8_t(uint8_t tag, size_t len, const uint8_t* val) : tag{tag}, len{len} {       
   if(len>0){
     this->val.reset((uint8_t *)HS_MALLOC(len));
+    if(this->val.get()==NULL){
+      Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",len);
+      while(1);
+    }
     if(val!=NULL)
       memcpy((this->val).get(),val,len);      
   }
@@ -42,8 +46,10 @@ tlv8_t::tlv8_t(uint8_t tag, size_t len, const uint8_t* val) : tag{tag}, len{len}
 void tlv8_t::update(size_t addLen, const uint8_t *addVal){
   if(addLen>0){
     uint8_t *p=(uint8_t *)HS_REALLOC(val.get(),len+addLen);
-    if(p==NULL)                                   // allocation failed - leave existing value unchanged
-      return;
+    if(p==NULL){
+      Serial.printf("\n\n*** FATAL ERROR: Requested allocation of %d bytes failed.  Program Halting.\n\n",len+addLen);
+      while(1);
+    }
     val.release();                                // ownership transferred to realloc'd pointer
     val.reset(p);
     if(addVal!=NULL)
@@ -84,8 +90,9 @@ TLV8_itc TLV8::add(uint8_t tag, size_t len, const uint8_t* val) {
 
 TLV8_itc TLV8::add(uint8_t tag, TLV8 &subTLV){
   
+  size_t offset=(!empty() && back().getTag()==tag)?back().getLen():0;      // existing data if new record will be merged with last record
   auto it=add(tag,subTLV.pack_size(),NULL);      // create space for inserting sub TLV and store iterator to new element
-  subTLV.pack(*it);                              // pack subTLV into new element
+  subTLV.pack((uint8_t *)*it+offset);            // pack subTLV into new element, after any existing data
   return(--end());
 }
 

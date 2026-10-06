@@ -28,20 +28,65 @@
 #include "Utils.h"
 #include "HomeSpan.h"
 
+#include <mutex>
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 //  Contains various generic utility functions and classes:
 //
-//  Utils::readSerial       - reads all characters from Serial port and saves only up to max specified
+//  Utils::readSerial       - reads all characters from Serial port and saves only up to max specified (with optional idle timeout)
 //  Utils::mask             - masks a string with asterisks (good for displaying passwords)
 //  Utils::resetReason      - returns literal string description of esp_reset_reason()
+//  Utils::logLock/Unlock   - take/release the recursive mutex that makes each LOG0/LOG1/LOG2 call atomic
+//  Utils::logPrintf        - locked Serial.printf used by LOG0/LOG1/LOG2 (single-argument form is the template Utils::logPrint in Utils.h)
 //
 //  class PushButton        - tracks Single, Double, and Long Presses of a pushbutton that connects a specified pin to ground
 //  class hsWatchdogTimer   - a generic watchdog timer that reboots the ESP32 device if not reset periodically
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-char *Utils::readSerial(char *c, int max){
+static std::recursive_mutex logMutex;
+
+//////////////////////////////////////
+
+void Utils::logLock(){
+  logMutex.lock();
+}
+
+//////////////////////////////////////
+
+void Utils::logUnlock(){
+  logMutex.unlock();
+}
+
+//////////////////////////////////////
+
+void Utils::logPrintf(const char *format, ...){
+  va_list args;
+  va_start(args,format);
+  logMutex.lock();
+  Serial.vprintf(format,args);
+  logMutex.unlock();
+  va_end(args);
+}
+
+//////////////////////////////////////
+
+void Utils::logPrint(const char *s){
+  logMutex.lock();
+  Serial.print(s);
+  logMutex.unlock();
+}
+
+//////////////////////////////////////
+
+void Utils::logPrint(char *s){
+  logPrint((const char *)s);
+}
+
+//////////////////////////////////////
+
+char *Utils::readSerial(char *c, int max, uint32_t idleTimeout){
 
   if(homeSpan.getSerialInputDisable()){
     c[0]='\0';
@@ -50,13 +95,20 @@ char *Utils::readSerial(char *c, int max){
   
   int i=0;
   char buf;
+  uint32_t t0=millis();                   // time of entry or of last character received
 
   while(1){
 
-    while(!Serial.available())            // wait until there is a new character
+    while(!Serial.available()){           // wait until there is a new character
       homeSpan.resetWatchdog();
+      if(idleTimeout>0 && millis()-t0>idleTimeout){     // idle timeout expired - discard what has been read
+        c[0]='\0';
+        return(c);
+      }
+    }
     
     buf=Serial.read();
+    t0=millis();
     
     if(buf=='\n'){         // exit upon newline
       if(i>0)              // characters have been typed
@@ -324,6 +376,7 @@ void PushButton::wait(){
 
 void PushButton::reset(){
   status=0;
+  doubleCheck=false;
 }
 
 //////////////////////////////////////
